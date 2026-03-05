@@ -3,13 +3,50 @@
 import { marked } from "marked";
 import hljs from "highlight.js";
 import "highlight.js/styles/github.css";
+import mermaid from "mermaid";
 import { onMounted, ref, nextTick, onUnmounted, onUpdated, watch } from "vue";
 import { downKnowledgeDetails, deleteGeneratedQuestion } from "@/api/knowledge-base/index";
 import { MessagePlugin, DialogPlugin } from "tdesign-vue-next";
-import { sanitizeHTML, safeMarkdownToHTML, createSafeImage, isValidImageURL } from '@/utils/security';
+import { sanitizeHTML, safeMarkdownToHTML, createSafeImage, isValidImageURL, hydrateProtectedFileImages } from '@/utils/security';
+import { openMermaidFullscreen } from '@/utils/mermaidViewer';
 import { useI18n } from 'vue-i18n';
+import DocumentPreview from '@/components/document-preview.vue';
 
 const { t } = useI18n();
+
+// Mermaid 初始化计数器，用于生成唯一ID
+let mermaidRenderCount = 0;
+
+// 初始化 Mermaid
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'default',
+  securityLevel: 'strict',
+  fontFamily: 'PingFang SC, Microsoft YaHei, sans-serif',
+  flowchart: {
+    useMaxWidth: true,
+    htmlLabels: true,
+    curve: 'basis'
+  },
+  sequence: {
+    useMaxWidth: true,
+    diagramMarginX: 8,
+    diagramMarginY: 8,
+    actorMargin: 50,
+    width: 150,
+    height: 65
+  },
+  gantt: {
+    useMaxWidth: true,
+    leftPadding: 75,
+    gridLineStartPadding: 35,
+    barHeight: 20,
+    barGap: 4,
+    topPadding: 50
+  }
+});
+const props = defineProps(["visible", "details", "knowledgeType", "sourceInfo"]);
+const emit = defineEmits(["closeDoc", "getDoc", "questionDeleted"]);
 
 marked.use({
   mangle: false,
@@ -19,14 +56,16 @@ marked.use({
 });
 const renderer = new marked.Renderer();
 let page = 1;
+let loadingChunks = false;
+let pendingRequestedPage: number | null = null;
+let pendingChunksBeforeLoad = 0;
 let doc = null;
 let down = ref()
 let mdContentWrap = ref()
 let url = ref('')
-// 视图模式：chunks / original / merged
-const viewMode = ref<'chunks' | 'original' | 'merged'>('merged');
-const originalContent = ref<string>('');
-const loadingOriginal = ref(false);
+// 视图模式：chunks / merged / preview
+// file 类型默认「预览」，URL / 手动创建 默认「全文」
+const viewMode = ref<'chunks' | 'merged' | 'preview'>('merged');
 
 // 合并后的文档内容
 const mergedContent = ref<string>('');
@@ -102,9 +141,27 @@ onMounted(() => {
     doc.addEventListener('scroll', handleDetailsScroll);
   })
 })
-onUpdated(() => {
-  page = 1
-})
+watch(() => props.details?.id, () => {
+  page = 1;
+  loadingChunks = false;
+  pendingRequestedPage = null;
+  pendingChunksBeforeLoad = 0;
+});
+watch(() => props.details?.chunkLoading, (val) => {
+  if (val === false) {
+    if (pendingRequestedPage !== null) {
+      const currentLength = props.details?.md?.length || 0;
+      const hasError = Boolean(props.details?.chunkLoadError);
+      if (hasError && currentLength <= pendingChunksBeforeLoad) {
+        page = Math.max(1, pendingRequestedPage - 1);
+        MessagePlugin.warning(props.details?.chunkLoadError || '分块加载失败，请继续下滑重试');
+      }
+    }
+    pendingRequestedPage = null;
+    pendingChunksBeforeLoad = 0;
+    loadingChunks = false;
+  }
+});
 onUnmounted(() => {
   doc.removeEventListener('scroll', handleDetailsScroll);
 })
@@ -133,6 +190,15 @@ renderer.image = function (href, title, text) {
 // 自定义代码块渲染器，只显示语言标签
 renderer.code = function (code, infostring) {
   const lang = (infostring || '').trim();
+
+  // Mermaid 图表处理
+  if (lang === 'mermaid') {
+    // 生成唯一ID
+    const id = `mermaid-${++mermaidRenderCount}`;
+    // 返回带有 mermaid 类的 div，后续由 mermaid.run() 处理
+    return `<div class="mermaid" id="${id}">${code}</div>`;
+  }
+
   let detectedLang = lang;
   let highlighted = '';
   if (lang && hljs.getLanguage(lang)) {
@@ -157,9 +223,6 @@ renderer.code = function (code, infostring) {
     </div>
   `;
 };
-const props = defineProps(["visible", "details", "knowledgeType", "sourceInfo"]);
-const emit = defineEmits(["closeDoc", "getDoc", "questionDeleted"]);
-
 // 监听 chunks 变化，自动更新合并内容
 watch(() => props.details?.md, (newChunks) => {
   if (newChunks && newChunks.length > 0) {
@@ -168,6 +231,31 @@ watch(() => props.details?.md, (newChunks) => {
     mergedContent.value = '';
   }
 }, { immediate: true, deep: true });
+
+const previewSupportedTypes = new Set([
+  'pdf', 'docx', 'pptx', 'ppt', 'xlsx', 'xls', 'csv',
+  'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'svg',
+  'txt', 'md', 'markdown', 'json', 'xml', 'html', 'css', 'js', 'ts',
+  'py', 'java', 'go', 'cpp', 'c', 'h', 'sh', 'yaml', 'yml',
+  'ini', 'conf', 'log', 'sql', 'rs', 'rb', 'php', 'swift', 'kt',
+  'scala', 'r', 'lua', 'pl', 'toml',
+]);
+
+const canPreview = (): boolean => {
+  if (props.details?.type !== 'file') return false;
+  const ft = props.details?.file_type?.toLowerCase();
+  return !!ft && previewSupportedTypes.has(ft);
+};
+
+// 当文档详情加载完成时，file 类型自动切换到「预览」
+watch(() => props.details?.id, (newId) => {
+  if (!newId) return;
+  if (props.details?.type === 'file' && canPreview()) {
+    viewMode.value = 'preview';
+  } else {
+    viewMode.value = 'merged';
+  }
+});
 
 const isTextFile = (fileType?: string): boolean => {
   if (!fileType) return false;
@@ -179,28 +267,11 @@ const isMarkdownFile = (fileType?: string): boolean => {
   const markdownTypes = ['md', 'markdown'];
   return markdownTypes.includes(fileType.toLowerCase());
 };
-const loadOriginalContent = async () => {
-  if (!props.details.id || !props.details.type || props.details.type !== 'file') return;
-  const fileType = props.details.file_type?.toLowerCase();
-  if (!isTextFile(fileType)) {
-    MessagePlugin.warning(t('knowledgeBase.originalFileNotSupported') || '该文件类型不支持原文件展示，请下载查看');
-    return;
-  }
-  loadingOriginal.value = true;
-  try {
-    const blob = await downKnowledgeDetails(props.details.id);
-    const text = await blob.text();
-    originalContent.value = text;
-  } catch (error: any) {
-    console.error('Failed to load original content:', error);
-    MessagePlugin.error(error?.message || t('knowledgeBase.loadOriginalFailed') || '加载原文件内容失败');
-  } finally {
-    loadingOriginal.value = false;
-  }
-};
 watch(() => props.details.md, (newVal) => {
   nextTick(async () => {
-    const images = mdContentWrap.value.querySelectorAll('img.markdown-image');
+    const renderRoot = (doc as ParentNode) || mdContentWrap.value;
+    await hydrateProtectedFileImages(renderRoot);
+    const images = renderRoot?.querySelectorAll?.('img.markdown-image') as NodeListOf<HTMLImageElement> | undefined;
     if (images) {
       images.forEach(async item => {
         const isValid = await checkImage(item.src);
@@ -209,8 +280,59 @@ watch(() => props.details.md, (newVal) => {
         }
       })
     }
+    // 渲染 Mermaid 图表
+    await renderMermaidDiagrams();
   })
 }, { immediate: true, deep: true })
+
+// 渲染 Mermaid 图表的函数
+const renderMermaidDiagrams = async () => {
+  try {
+    const mermaidElements = mdContentWrap.value?.querySelectorAll('.mermaid');
+    console.log('[Mermaid] Found mermaid elements:', mermaidElements?.length);
+    if (mermaidElements && mermaidElements.length > 0) {
+      await mermaid.run({
+        nodes: mermaidElements
+      });
+      console.log('[Mermaid] Rendering complete');
+      // 渲染完成后绑定点击事件
+      nextTick(() => {
+        bindMermaidClickEvents();
+      });
+    }
+  } catch (error) {
+    console.error('Mermaid rendering error:', error);
+  }
+};
+
+// Mermaid 点击处理函数 - 必须在 bindMermaidClickEvents 之前定义
+const handleMermaidClick = (e: Event) => {
+  e.stopPropagation();
+  const target = e.currentTarget as HTMLElement;
+  const svg = target.querySelector('svg');
+  if (svg) {
+    openMermaidFullscreen(svg.outerHTML);
+  }
+};
+
+// 为 Mermaid 容器绑定点击全屏事件（绑定在 div 上，不是 SVG 上）
+const bindMermaidClickEvents = () => {
+  if (!mdContentWrap.value) {
+    console.log('[Mermaid] mdContentWrap is null');
+    return;
+  }
+  // 绑定在 .mermaid div 上，而不是 SVG 上
+  const mermaidDivs = mdContentWrap.value.querySelectorAll('.mermaid');
+  console.log('[Mermaid] Found mermaid divs:', mermaidDivs.length);
+  mermaidDivs.forEach((div, index) => {
+    const divEl = div as HTMLElement;
+    divEl.style.cursor = 'pointer';
+    // 移除旧的事件监听器（避免重复绑定）
+    divEl.removeEventListener('click', handleMermaidClick);
+    divEl.addEventListener('click', handleMermaidClick);
+    console.log(`[Mermaid] Bound click event to div ${index}`);
+  });
+};
 
 // 安全地处理 Markdown 内容（使用 marked）
 const processMarkdown = (markdownText) => {
@@ -252,7 +374,6 @@ const handleClose = () => {
   emit("closeDoc", false);
   doc.scrollTop = 0;
   viewMode.value = 'merged';
-  originalContent.value = '';
 };
 
 // 获取显示标题
@@ -460,12 +581,15 @@ const downloadFile = () => {
     });
 };
 const handleDetailsScroll = () => {
-  if (doc) {
-    let pageNum = Math.ceil(props.details.total / 20);
+  if (doc && !loadingChunks) {
+    let pageNum = Math.ceil(props.details.total / 25);
     const { scrollTop, scrollHeight, clientHeight } = doc;
-    if (scrollTop + clientHeight >= scrollHeight) {
-      page++;
-      if (props.details.md.length < props.details.total && page <= pageNum) {
+    if (scrollTop + clientHeight >= scrollHeight - 8) {
+      if (props.details.md.length < props.details.total && page + 1 <= pageNum) {
+        page++;
+        loadingChunks = true;
+        pendingRequestedPage = page;
+        pendingChunksBeforeLoad = props.details.md.length;
         emit("getDoc", page);
       }
     }
@@ -528,6 +652,17 @@ const handleDetailsScroll = () => {
             <span class="time"> {{ getTimeLabel() }}：{{ details.time }} </span>
             <div class="view-mode-buttons">
               <t-button 
+                v-if="canPreview()"
+                size="small" 
+                :variant="viewMode === 'preview' ? 'base' : 'outline'" 
+                :theme="viewMode === 'preview' ? 'primary' : 'default'"
+                @click="viewMode = 'preview'"
+                class="view-mode-btn"
+              >
+                {{ $t('preview.tab') || '预览' }}
+              </t-button>
+              <t-button 
+                v-if="!canPreview()"
                 size="small" 
                 :variant="viewMode === 'merged' ? 'base' : 'outline'" 
                 :theme="viewMode === 'merged' ? 'primary' : 'default'"
@@ -545,7 +680,6 @@ const handleDetailsScroll = () => {
               >
                 {{ $t('knowledgeBase.viewChunks') || '分块' }}
               </t-button>
-
             </div>
           </div>
         </div>
@@ -613,6 +747,16 @@ const handleDetailsScroll = () => {
             </div>
           </div>
         </div>
+      </div>
+      
+      <!-- 文档预览视图 -->
+      <div v-else-if="viewMode === 'preview'">
+        <DocumentPreview
+          :knowledgeId="details.id"
+          :fileType="details.file_type"
+          :fileName="details.title"
+          :active="viewMode === 'preview'"
+        />
       </div>
       
       <template #footer>

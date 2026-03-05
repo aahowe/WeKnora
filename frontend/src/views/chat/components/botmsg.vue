@@ -52,16 +52,32 @@ import docInfo from './docInfo.vue';
 import deepThink from './deepThink.vue';
 import AgentStreamDisplay from './AgentStreamDisplay.vue';
 import picturePreview from '@/components/picture-preview.vue';
-import { sanitizeHTML, safeMarkdownToHTML, createSafeImage, isValidImageURL } from '@/utils/security';
+import { sanitizeHTML, safeMarkdownToHTML, createSafeImage, isValidImageURL, hydrateProtectedFileImages } from '@/utils/security';
+import { openMermaidFullscreen } from '@/utils/mermaidViewer';
 import { useI18n } from 'vue-i18n';
 import { MessagePlugin } from 'tdesign-vue-next';
 import { useUIStore } from '@/stores/ui';
+import {
+    buildManualMarkdown,
+    copyTextToClipboard,
+    formatManualTitle,
+    replaceIncompleteImageWithPlaceholder
+} from '@/utils/chatMessageShared';
+import {
+    bindMermaidFullscreenEvents,
+    createMermaidCodeRenderer,
+    ensureMermaidInitialized,
+    renderMermaidInContainer
+} from '@/utils/mermaidShared';
 
 marked.use({
     mangle: false,
     headerIds: false,
     breaks: true,  // 全局启用单个换行支持
 });
+
+ensureMermaidInitialized();
+
 const emit = defineEmits(['scroll-bottom'])
 const { t } = useI18n()
 const uiStore = useUIStore();
@@ -115,15 +131,20 @@ customRenderer.image = function(href, title, text) {
     return createSafeImage(href, text || '', title || '');
 };
 
+// 覆盖代码块渲染方法，支持 Mermaid
+customRenderer.code = createMermaidCodeRenderer('mermaid-botmsg');
+
 // 计算属性：将 Markdown 文本转换为 tokens
 const markdownTokens = computed(() => {
     const text = props.content || props.session?.content || '';
     if (!text || typeof text !== 'string') {
         return [];
     }
+
+    const processed = replaceIncompleteImageWithPlaceholder(text);
     
     // 首先对 Markdown 内容进行安全处理
-    const safeMarkdown = safeMarkdownToHTML(text);
+    const safeMarkdown = safeMarkdownToHTML(processed);
     
     // 使用 marked.lexer 分词
     return marked.lexer(safeMarkdown);
@@ -165,24 +186,6 @@ const getActualContent = () => {
     return (props.content || props.session?.content || '').trim();
 };
 
-// 格式化标题
-const formatManualTitle = (question) => {
-    if (!question) {
-        return '会话摘录';
-    }
-    const condensed = question.replace(/\s+/g, ' ').trim();
-    if (!condensed) {
-        return '会话摘录';
-    }
-    return condensed.length > 40 ? `${condensed.slice(0, 40)}...` : condensed;
-};
-
-// 构建手动添加的 Markdown 内容
-const buildManualMarkdown = (question, answer) => {
-    const safeAnswer = answer?.trim() || '（无回答内容）';
-    return `${safeAnswer}`;
-};
-
 // 复制回答内容
 const handleCopyAnswer = async () => {
     const content = getActualContent();
@@ -192,20 +195,8 @@ const handleCopyAnswer = async () => {
     }
 
     try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            await navigator.clipboard.writeText(content);
-            MessagePlugin.success(t('chat.copySuccess') || '已复制到剪贴板');
-        } else {
-            const textArea = document.createElement('textarea');
-            textArea.value = content;
-            textArea.style.position = 'fixed';
-            textArea.style.opacity = '0';
-            document.body.appendChild(textArea);
-            textArea.select();
-            document.execCommand('copy');
-            document.body.removeChild(textArea);
-            MessagePlugin.success(t('chat.copySuccess') || '已复制到剪贴板');
-        }
+        await copyTextToClipboard(content);
+        MessagePlugin.success(t('chat.copySuccess') || '已复制到剪贴板');
     } catch (err) {
         console.error('复制失败:', err);
         MessagePlugin.error(t('chat.copyFailed') || '复制失败，请手动复制');
@@ -247,12 +238,50 @@ const handleMarkdownImageClick = (e) => {
     }
 };
 
+// 渲染 Mermaid 图表的函数
+const renderMermaidDiagrams = async () => {
+    try {
+        const renderedCount = await renderMermaidInContainer(parentMd.value, renderedMermaidIds);
+        if (renderedCount > 0) {
+            nextTick(() => {
+                bindMermaidClickEvents();
+            });
+        }
+    } catch (error) {
+        console.error('Mermaid rendering error:', error);
+    }
+};
+
+// 已渲染的 mermaid 元素 ID 集合
+const renderedMermaidIds = new Set();
+
+// 为 Mermaid 容器绑定点击全屏事件（绑定在 div 上，不是 SVG 上）
+const bindMermaidClickEvents = () => {
+    bindMermaidFullscreenEvents(parentMd.value, (svgOuterHTML) => {
+        openMermaidFullscreen(svgOuterHTML);
+    });
+};
+
+// 监听内容变化并渲染 Mermaid - 只在会话完成后渲染
+watch(() => [props.content, props.session?.content, props.session?.is_completed], () => {
+    nextTick(async () => {
+        await hydrateProtectedFileImages(parentMd.value);
+        // 只在会话完成后渲染 mermaid
+        if (props.session?.is_completed) {
+            renderMermaidDiagrams();
+        }
+    });
+}, { immediate: true });
+
 onMounted(async () => {
     // 为 markdown-content 中的图片添加点击事件
-    nextTick(() => {
+    nextTick(async () => {
         if (parentMd.value) {
             parentMd.value.addEventListener('click', handleMarkdownImageClick, true);
         }
+        await hydrateProtectedFileImages(parentMd.value);
+        // 初始渲染 Mermaid 图表
+        renderMermaidDiagrams();
     });
 });
 
@@ -264,6 +293,7 @@ onBeforeUnmount(() => {
 </script>
 <style lang="less" scoped>
 @import '../../../components/css/markdown.less';
+@import '../../../components/css/chat-message-shared.less';
 
 // 内容包装器 - 与 Agent 模式的 answer 样式一致
 .content-wrapper {
@@ -389,6 +419,21 @@ onBeforeUnmount(() => {
             transform: scale(1.02);
         }
     }
+
+    // Mermaid 图表样式
+    :deep(.mermaid) {
+        margin: 16px 0;
+        padding: 16px;
+        background: #f8f9fa;
+        border-radius: 8px;
+        overflow-x: auto;
+        text-align: center;
+
+        svg {
+            max-width: 100%;
+            height: auto;
+        }
+    }
 }
 
 .ai-markdown-img {
@@ -462,81 +507,6 @@ onBeforeUnmount(() => {
     }
     30% {
         transform: translateY(-8px);
-    }
-}
-
-// 复制和添加到知识库按钮工具栏
-.answer-toolbar {
-    display: flex;
-    justify-content: flex-start;
-    gap: 6px;
-    margin-top: 8px;
-    min-height: 32px;
-
-    :deep(.t-button) {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: auto;
-        width: auto;
-        border: 1px solid #e0e0e0;
-        border-radius: 6px;
-        background: #ffffff;
-        color: #666;
-        transition: all 0.2s ease;
-        
-        .t-button__content {
-            display: inline-flex !important;
-            align-items: center;
-            justify-content: center;
-            gap: 0;
-        }
-        
-        .t-button__text {
-            display: inline-flex !important;
-            align-items: center;
-            justify-content: center;
-            gap: 0;
-        }
-        
-        .t-icon {
-            display: inline-flex !important;
-            visibility: visible !important;
-            opacity: 1 !important;
-            align-items: center;
-            justify-content: center;
-            font-size: 16px;
-            width: 16px;
-            height: 16px;
-            flex-shrink: 0;
-            color: #666;
-        }
-        
-        .t-icon svg {
-            display: block !important;
-            width: 16px;
-            height: 16px;
-        }
-        
-        .t-button__text > :not(.t-icon) {
-            display: none;
-        }
-        
-        &:hover:not(:disabled) {
-            background: rgba(7, 192, 95, 0.08);
-            border-color: rgba(7, 192, 95, 0.3);
-            color: #07c05f;
-            
-            .t-icon {
-                color: #07c05f;
-            }
-        }
-        
-        &:active:not(:disabled) {
-            background: rgba(7, 192, 95, 0.12);
-            border-color: rgba(7, 192, 95, 0.4);
-            transform: translateY(0.5px);
-        }
     }
 }
 
