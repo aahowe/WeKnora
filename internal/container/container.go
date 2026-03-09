@@ -39,6 +39,7 @@ import (
 	postgresRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/postgres"
 	qdrantRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/qdrant"
 	sqliteRetrieverRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/sqlite"
+	weaviateRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/weaviate"
 	"github.com/Tencent/WeKnora/internal/application/service"
 	chatpipline "github.com/Tencent/WeKnora/internal/application/service/chat_pipline"
 	"github.com/Tencent/WeKnora/internal/application/service/file"
@@ -61,6 +62,9 @@ import (
 	"github.com/Tencent/WeKnora/internal/tracing"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/weaviate/weaviate-go-client/v5/weaviate"
+	"github.com/weaviate/weaviate-go-client/v5/weaviate/auth"
+	wgrpc "github.com/weaviate/weaviate-go-client/v5/weaviate/grpc"
 )
 
 // BuildContainer constructs the dependency injection container
@@ -530,6 +534,26 @@ func initFileService(cfg *config.Config) (interfaces.FileService, error) {
 			os.Getenv("TOS_TEMP_BUCKET_NAME"), // 可选：临时桶名称（桶需配置生命周期规则自动过期）
 			os.Getenv("TOS_TEMP_REGION"),      // 可选：临时桶 region，默认与主桶相同
 		)
+	case "s3":
+		if os.Getenv("S3_ENDPOINT") == "" ||
+			os.Getenv("S3_REGION") == "" ||
+			os.Getenv("S3_ACCESS_KEY") == "" ||
+			os.Getenv("S3_SECRET_KEY") == "" ||
+			os.Getenv("S3_BUCKET_NAME") == "" {
+			return nil, fmt.Errorf("missing S3 configuration")
+		}
+		pathPrefix := os.Getenv("S3_PATH_PREFIX")
+		if pathPrefix == "" {
+			pathPrefix = "weknora/"
+		}
+		return file.NewS3FileService(
+			os.Getenv("S3_ENDPOINT"),
+			os.Getenv("S3_ACCESS_KEY"),
+			os.Getenv("S3_SECRET_KEY"),
+			os.Getenv("S3_BUCKET_NAME"),
+			os.Getenv("S3_REGION"),
+			pathPrefix,
+		)
 	case "local":
 		baseDir := os.Getenv("LOCAL_STORAGE_BASE_DIR")
 		if baseDir == "" {
@@ -666,6 +690,49 @@ func initRetrieveEngineRegistry(db *gorm.DB, cfg *config.Config) (interfaces.Ret
 				log.Errorf("Register qdrant retrieve engine failed: %v", err)
 			} else {
 				log.Infof("Register qdrant retrieve engine success")
+			}
+		}
+	}
+	if slices.Contains(retrieveDriver, "weaviate") {
+		weaviateHost := os.Getenv("WEAVIATE_HOST")
+		if weaviateHost == "" {
+			// Docker compose default (service name inside network)
+			weaviateHost = "weaviate:8080"
+		}
+		weaviateGrpcAddress := os.Getenv("WEAVIATE_GRPC_ADDRESS")
+		if weaviateGrpcAddress == "" {
+			weaviateGrpcAddress = "weaviate:50051"
+		}
+		weaviateScheme := os.Getenv("WEAVIATE_SCHEME")
+		if weaviateScheme == "" {
+			weaviateScheme = "http"
+		}
+		var authConfig auth.Config
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("WEAVIATE_AUTH_ENABLED")), "true") {
+			if apiKey := strings.TrimSpace(os.Getenv("WEAVIATE_API_KEY")); apiKey != "" {
+				authConfig = auth.ApiKey{Value: apiKey}
+			}
+		}
+		weaviateClient, err := weaviate.NewClient(weaviate.Config{
+			Host: weaviateHost,
+			GrpcConfig: &wgrpc.Config{
+				Host: weaviateGrpcAddress,
+			},
+			Scheme:     weaviateScheme,
+			AuthConfig: authConfig,
+		})
+		if err != nil {
+			log.Errorf("Create weaviate client failed: %v", err)
+		} else {
+			weaviateRepository := weaviateRepo.NewWeaviateRetrieveEngineRepository(weaviateClient)
+			if err := registry.Register(
+				retriever.NewKVHybridRetrieveEngine(
+					weaviateRepository, types.WeaviateRetrieverEngineType,
+				),
+			); err != nil {
+				log.Errorf("Register weaviate retrieve engine failed: %v", err)
+			} else {
+				log.Infof("Register weaviate retrieve engine success")
 			}
 		}
 	}
