@@ -11,12 +11,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/tracing"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
 )
 
@@ -34,22 +40,57 @@ const (
 	streamFlushInterval = 300 * time.Millisecond
 )
 
+const (
+	// wsLeaderTTL is the TTL for the Redis key used for WebSocket leader election.
+	wsLeaderTTL = 15 * time.Second
+	// wsLeaderRenewInterval is how often the leader renews its lock.
+	wsLeaderRenewInterval = 5 * time.Second
+	// wsLeaderRetryInterval is how often non-leader instances try to acquire the lock.
+	wsLeaderRetryInterval = 10 * time.Second
+	// stopMarkerTTL is the TTL for cross-instance /stop markers in Redis.
+	stopMarkerTTL = 30 * time.Second
+	// stopPollInterval is how often in-flight workers check for remote /stop signals.
+	stopPollInterval = 500 * time.Millisecond
+)
+
+// ── Redis key prefixes ──────────────────────────────────────────────────────
+// All IM-related Redis keys are defined here for discoverability and to avoid
+// scattered string literals across multiple files.
+const (
+	RedisKeyLeader     = "im:ws:leader:"     // + channelID — WebSocket leader election
+	RedisKeyDedup      = "im:dedup:"         // + messageID — message deduplication
+	RedisKeyStop       = "im:stop:"          // + userKey   — cross-instance /stop marker (pre-execution)
+	RedisKeyInflight   = "im:inflight:"      // + userKey   — maps userKey → sessionID:messageID for cross-instance /stop
+	RedisKeyQueueUser  = "im:queue:user:"    // + userKey   — global per-user queue counter
+	RedisKeyRateLimit  = "im:ratelimit:"     // + key       — sliding-window rate limiting
+	RedisKeyGlobalGate = "im:global:active"  // global concurrent worker counter
+)
+
 // channelState holds runtime state for a running IM channel.
 type channelState struct {
-	Channel *IMChannel
-	Adapter Adapter
-	Cancel  context.CancelFunc // for stopping websocket goroutines
+	Channel      *IMChannel
+	Adapter      Adapter
+	Cancel       context.CancelFunc // for stopping websocket goroutines
+	leaderCancel context.CancelFunc // stops the leader renewal goroutine (nil if not leader)
 }
 
 // AdapterFactory creates an Adapter from an IMChannel configuration.
 // The second return value is an optional cleanup function (e.g., for stopping websocket connections).
 type AdapterFactory func(ctx context.Context, channel *IMChannel, msgHandler func(ctx context.Context, msg *IncomingMessage) error) (Adapter, context.CancelFunc, error)
 
+// inflightEntry tracks a running QA request, keyed by userKey in the inflight map.
+type inflightEntry struct {
+	cancel             context.CancelFunc
+	sessionID          string // set after assistant message is created
+	assistantMessageID string // set after assistant message is created
+}
+
 // Service orchestrates IM message handling:
 // 1. Receives a unified IncomingMessage from an Adapter
 // 2. Resolves or creates a WeKnora session for the IM channel
-// 3. Calls the WeKnora QA pipeline
-// 4. Collects the streaming answer and sends it back via the Adapter
+// 3. Dispatches slash-commands (/help, /kb, /clear, etc.) without entering QA
+// 4. Calls the WeKnora QA pipeline for normal messages
+// 5. Collects the streaming answer and sends it back via the Adapter
 type Service struct {
 	db             *gorm.DB
 	sessionService interfaces.SessionService
@@ -60,8 +101,19 @@ type Service struct {
 	// knowledgeService is used for saving IM file messages to knowledge bases.
 	knowledgeService interfaces.KnowledgeService
 
+	// kbService is used by slash-commands (/info) to list and inspect knowledge bases.
+	kbService interfaces.KnowledgeBaseService
+
 	// modelService is used to obtain the chat model for generating smart notification replies.
 	modelService interfaces.ModelService
+
+	// streamManager writes/reads QA events for distributed stop detection,
+	// consistent with the web StopSession mechanism. May be nil in Lite mode
+	// (but NewStreamManager always returns at least a memory implementation).
+	streamManager interfaces.StreamManager
+
+	// cmdRegistry holds all registered slash-commands.
+	cmdRegistry *CommandRegistry
 
 	// channels maps channel ID -> running channel state
 	channels map[string]*channelState
@@ -73,7 +125,34 @@ type Service struct {
 	// processedMsgs tracks recently processed message IDs to prevent duplicate handling.
 	processedMsgs sync.Map
 
+	// rateLimiter enforces per-user sliding window rate limiting.
+	// Uses Redis ZSET when available, falls back to local sliding window.
+	rateLimiter *distributedLimiter
+
+	// inflight tracks in-progress QA requests, keyed by userKey
+	// ("channelID:userID:chatID"). Allows /stop to abort a running request
+	// on this instance and look up (sessionID, messageID) for StreamManager.
+	inflight sync.Map // userKey -> *inflightEntry
+
+	// qaQueue manages bounded queuing and worker-pool execution of QA requests,
+	// providing backpressure to protect downstream LLM resources.
+	qaQueue *qaQueue
+
+	// redis is the optional Redis client for distributed state (dedup, rate
+	// limiting, leader election, cross-instance /stop). When nil the service
+	// falls back to local in-memory state (single-instance / Lite mode).
+	redis *redis.Client
+
+	// instanceID uniquely identifies this service instance for leader election.
+	instanceID string
+
 	stopCh chan struct{}
+}
+
+// makeUserKey builds the canonical key used to identify a user's request
+// across the queue, inflight map, and /stop command.
+func makeUserKey(channelID, userID, chatID string) string {
+	return fmt.Sprintf("%s:%s:%s", channelID, userID, chatID)
 }
 
 func buildIMQARequest(
@@ -84,6 +163,10 @@ func buildIMQARequest(
 	customAgent *types.CustomAgent,
 	kbIDs []string,
 ) *types.QARequest {
+	// WebSearchEnabled: the web handler passes this per-request from the
+	// frontend toggle; for IM channels the user has no per-message toggle,
+	// so we derive it from the agent config (the single source of truth).
+	webSearchEnabled := customAgent != nil && customAgent.Config.WebSearchEnabled
 	return &types.QARequest{
 		Session:            session,
 		Query:              query,
@@ -91,10 +174,48 @@ func buildIMQARequest(
 		CustomAgent:        customAgent,
 		KnowledgeBaseIDs:   kbIDs,
 		UserMessageID:      userMessageID,
+		WebSearchEnabled:   webSearchEnabled,
 	}
 }
 
+// resolveIMConfig extracts IM tuning parameters from the application config,
+// falling back to built-in defaults for any zero/nil values.
+func resolveIMConfig(appCfg *config.Config) (workers, maxQueue, maxPerUser, globalMaxWorkers int, rlWindow time.Duration, rlMax int) {
+	workers = defaultWorkers
+	maxQueue = defaultMaxQueueSize
+	maxPerUser = defaultMaxPerUser
+	rlWindow = rateLimitWindow
+	rlMax = rateLimitMaxRequests
+
+	if appCfg == nil || appCfg.IM == nil {
+		return
+	}
+	im := appCfg.IM
+	if im.Workers > 0 {
+		workers = im.Workers
+	}
+	if im.MaxQueueSize > 0 {
+		maxQueue = im.MaxQueueSize
+	}
+	if im.MaxPerUser > 0 {
+		maxPerUser = im.MaxPerUser
+	}
+	if im.GlobalMaxWorkers > 0 {
+		globalMaxWorkers = im.GlobalMaxWorkers
+	}
+	if im.RateLimitWindow > 0 {
+		rlWindow = im.RateLimitWindow
+	}
+	if im.RateLimitMax > 0 {
+		rlMax = im.RateLimitMax
+	}
+	return
+}
+
 // NewService creates a new IM service.
+// redisClient may be nil — in that case the service falls back to local
+// in-memory state (Lite / single-instance mode).
+// cfg may be nil — in that case built-in defaults are used.
 func NewService(
 	db *gorm.DB,
 	sessionService interfaces.SessionService,
@@ -102,8 +223,24 @@ func NewService(
 	tenantService interfaces.TenantService,
 	agentService interfaces.CustomAgentService,
 	knowledgeService interfaces.KnowledgeService,
+	kbService interfaces.KnowledgeBaseService,
 	modelService interfaces.ModelService,
+	streamManager interfaces.StreamManager,
+	redisClient *redis.Client,
+	appCfg *config.Config,
 ) *Service {
+	// Resolve IM configuration with defaults.
+	workers, maxQueue, maxPerUser, globalMaxWorkers, rlWindow, rlMax := resolveIMConfig(appCfg)
+
+	// Build command registry.
+	registry := NewCommandRegistry()
+	registry.Register(newHelpCommand(registry))
+	registry.Register(newInfoCommand(kbService))
+	registry.Register(newSearchCommand(sessionService, kbService))
+	registry.Register(newStopCommand())
+	registry.Register(newClearCommand())
+
+	instanceID := uuid.New().String()
 	s := &Service{
 		db:               db,
 		sessionService:   sessionService,
@@ -111,14 +248,41 @@ func NewService(
 		tenantService:    tenantService,
 		agentService:     agentService,
 		knowledgeService: knowledgeService,
+		kbService:        kbService,
 		modelService:     modelService,
+		streamManager:    streamManager,
+		cmdRegistry:      registry,
 		channels:         make(map[string]*channelState),
 		adapterFactories: make(map[string]AdapterFactory),
+		rateLimiter:      newDistributedLimiter(redisClient, rlWindow, rlMax, instanceID),
+		redis:            redisClient,
+		instanceID:       instanceID,
 		stopCh:           make(chan struct{}),
 	}
 
-	// Start periodic dedup cleanup instead of per-message goroutines
-	go s.dedupCleanupLoop()
+	// Initialize the QA worker pool and bounded queue.
+	s.qaQueue = newQAQueue(workers, maxQueue, maxPerUser, globalMaxWorkers, s.executeQARequest, redisClient)
+	s.qaQueue.Start(s.stopCh)
+
+	// Start periodic cleanup loops.
+	// Dedup cleanup is only needed in single-instance mode (local sync.Map);
+	// when Redis handles dedup, the TTL on Redis keys handles expiry automatically.
+	if redisClient == nil {
+		go s.dedupCleanupLoop()
+	}
+	go s.rateLimiter.cleanupLoop(s.stopCh)
+
+	if redisClient != nil {
+		globalInfo := "unlimited"
+		if globalMaxWorkers > 0 {
+			globalInfo = fmt.Sprintf("%d", globalMaxWorkers)
+		}
+		logger.Infof(context.Background(), "[IM] Multi-instance mode enabled (instance=%s, workers=%d, queue=%d, global_max=%s)",
+			s.instanceID[:8], workers, maxQueue, globalInfo)
+	} else {
+		logger.Infof(context.Background(), "[IM] Single-instance mode (no Redis, workers=%d, queue=%d)",
+			workers, maxQueue)
+	}
 
 	return s
 }
@@ -133,13 +297,11 @@ func (s *Service) RegisterAdapterFactory(platform string, factory AdapterFactory
 // Stop gracefully shuts down the service, stopping all channels and background goroutines.
 func (s *Service) Stop() {
 	close(s.stopCh)
+	s.qaQueue.Stop()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id, cs := range s.channels {
-		if cs.Cancel != nil {
-			cs.Cancel()
-		}
-		delete(s.channels, id)
+		s.stopChannelLocked(id, cs)
 	}
 }
 
@@ -186,7 +348,18 @@ func (s *Service) LoadAndStartChannels() error {
 }
 
 // StartChannel creates and registers an adapter for the given channel.
+// For WebSocket channels with Redis available, only one instance acquires
+// the leader lock and opens the connection; other instances periodically
+// retry so they can take over if the leader dies.
 func (s *Service) StartChannel(channel *IMChannel) error {
+	_, span := tracing.ContextWithSpan(context.Background(), "im.StartChannel")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("im.channel_id", channel.ID),
+		attribute.String("im.platform", channel.Platform),
+		attribute.String("im.mode", channel.Mode),
+	)
+
 	s.mu.Lock()
 	factory, ok := s.adapterFactories[channel.Platform]
 	if !ok {
@@ -195,13 +368,26 @@ func (s *Service) StartChannel(channel *IMChannel) error {
 	}
 	// Stop existing channel if running
 	if existing, ok := s.channels[channel.ID]; ok {
-		if existing.Cancel != nil {
-			existing.Cancel()
-		}
-		delete(s.channels, channel.ID)
+		s.stopChannelLocked(channel.ID, existing)
 	}
 	s.mu.Unlock()
 
+	// For WebSocket channels, try leader election to avoid duplicate connections.
+	if channel.Mode == "websocket" && s.redis != nil {
+		acquired := s.tryAcquireWSLeader(channel.ID)
+		if !acquired {
+			logger.Infof(context.Background(),
+				"[IM] Channel %s WebSocket owned by another instance, will retry", channel.ID)
+			go s.wsLeaderRetryLoop(channel)
+			return nil
+		}
+	}
+
+	return s.startChannelInternal(channel, factory)
+}
+
+// startChannelInternal does the actual adapter creation and registration.
+func (s *Service) startChannelInternal(channel *IMChannel, factory AdapterFactory) error {
 	// Build the message handler that delegates to HandleMessage with this channel's config
 	msgHandler := func(msgCtx context.Context, msg *IncomingMessage) error {
 		return s.HandleMessage(msgCtx, msg, channel.ID)
@@ -210,14 +396,24 @@ func (s *Service) StartChannel(channel *IMChannel) error {
 	ctx := context.Background()
 	adapter, cancelFn, err := factory(ctx, channel, msgHandler)
 	if err != nil {
+		s.releaseWSLeader(channel.ID) // release lock on failure
 		return fmt.Errorf("create adapter: %w", err)
+	}
+
+	// Start leader renewal goroutine for WebSocket channels.
+	var leaderCancel context.CancelFunc
+	if channel.Mode == "websocket" && s.redis != nil {
+		leaderCtx, lCancel := context.WithCancel(context.Background())
+		leaderCancel = lCancel
+		go s.wsLeaderRenewLoop(leaderCtx, channel.ID)
 	}
 
 	s.mu.Lock()
 	s.channels[channel.ID] = &channelState{
-		Channel: channel,
-		Adapter: adapter,
-		Cancel:  cancelFn,
+		Channel:      channel,
+		Adapter:      adapter,
+		Cancel:       cancelFn,
+		leaderCancel: leaderCancel,
 	}
 	s.mu.Unlock()
 
@@ -229,11 +425,230 @@ func (s *Service) StopChannel(channelID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cs, ok := s.channels[channelID]; ok {
-		if cs.Cancel != nil {
-			cs.Cancel()
+		s.stopChannelLocked(channelID, cs)
+	}
+}
+
+// stopChannelLocked stops a channel and removes it from the map.
+// Caller must hold s.mu.
+func (s *Service) stopChannelLocked(channelID string, cs *channelState) {
+	if cs.leaderCancel != nil {
+		cs.leaderCancel()
+	}
+	if cs.Cancel != nil {
+		cs.Cancel()
+	}
+	delete(s.channels, channelID)
+	s.releaseWSLeader(channelID)
+	logger.Infof(context.Background(), "[IM] Stopped channel: id=%s", channelID)
+}
+
+// ── WebSocket leader election ───────────────────────────────────────────────
+
+// tryAcquireWSLeader attempts to acquire the Redis lock for a WebSocket channel.
+// Returns true if this instance is now the leader.
+func (s *Service) tryAcquireWSLeader(channelID string) bool {
+	if s.redis == nil {
+		return true // single-instance mode: always leader
+	}
+	key := RedisKeyLeader + channelID
+	ok, err := s.redis.SetNX(context.Background(), key, s.instanceID, wsLeaderTTL).Result()
+	if err != nil {
+		logger.Warnf(context.Background(), "[IM] Redis leader election failed for %s: %v, assuming leader", channelID, err)
+		return true // Redis error: proceed anyway to avoid channel getting stuck
+	}
+	return ok
+}
+
+// releaseWSLeader releases the Redis leader lock for a WebSocket channel,
+// but only if this instance owns it.
+func (s *Service) releaseWSLeader(channelID string) {
+	if s.redis == nil {
+		return
+	}
+	key := RedisKeyLeader + channelID
+	// Only delete if we own it (compare-and-delete via Lua).
+	script := redis.NewScript(`
+		if redis.call('GET', KEYS[1]) == ARGV[1] then
+			return redis.call('DEL', KEYS[1])
+		end
+		return 0
+	`)
+	script.Run(context.Background(), s.redis, []string{key}, s.instanceID)
+}
+
+// wsLeaderRenewLoop periodically refreshes the leader lock TTL.
+// Stops when ctx is cancelled (channel stopped) or if the lock is lost.
+func (s *Service) wsLeaderRenewLoop(ctx context.Context, channelID string) {
+	key := RedisKeyLeader + channelID
+	ticker := time.NewTicker(wsLeaderRenewInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Only renew if we still own the lock.
+			script := redis.NewScript(`
+				if redis.call('GET', KEYS[1]) == ARGV[1] then
+					redis.call('PEXPIRE', KEYS[1], ARGV[2])
+					return 1
+				end
+				return 0
+			`)
+			result, err := script.Run(ctx, s.redis, []string{key}, s.instanceID, wsLeaderTTL.Milliseconds()).Int64()
+			if err != nil || result == 0 {
+				logger.Warnf(context.Background(),
+					"[IM] Lost leadership for channel %s, stopping adapter", channelID)
+				s.StopChannel(channelID)
+				return
+			}
+		case <-ctx.Done():
+			return
 		}
-		delete(s.channels, channelID)
-		logger.Infof(context.Background(), "[IM] Stopped channel: id=%s", channelID)
+	}
+}
+
+// wsLeaderRetryLoop periodically tries to acquire the WebSocket leader lock.
+// When it succeeds, it starts the channel adapter.
+func (s *Service) wsLeaderRetryLoop(channel *IMChannel) {
+	ticker := time.NewTicker(wsLeaderRetryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check if channel is already running (another goroutine may have started it).
+			if _, _, ok := s.GetChannelAdapter(channel.ID); ok {
+				return
+			}
+			if s.tryAcquireWSLeader(channel.ID) {
+				logger.Infof(context.Background(),
+					"[IM] Acquired leadership for channel %s, starting adapter", channel.ID)
+				s.mu.RLock()
+				factory, ok := s.adapterFactories[channel.Platform]
+				s.mu.RUnlock()
+				if !ok {
+					return
+				}
+				if err := s.startChannelInternal(channel, factory); err != nil {
+					logger.Warnf(context.Background(),
+						"[IM] Failed to start channel %s after acquiring leadership: %v", channel.ID, err)
+				}
+				return
+			}
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+// ── Cross-instance /stop via StreamManager ───────────────────────────────────
+//
+// The mechanism mirrors the web StopSession flow:
+//   1. /stop writes a stop StreamEvent to StreamManager (keyed by sessionID + messageID)
+//   2. A per-request watcher polls StreamManager and cancels the context on detection
+//
+// A Redis marker (im:stop:{userKey}) is kept as a lightweight pre-execution
+// check for requests that haven't created an assistant message yet.
+
+// checkAndClearStopMarker checks if a pre-execution /stop marker exists for
+// the given userKey. If found, it deletes the marker and returns true.
+func (s *Service) checkAndClearStopMarker(ctx context.Context, userKey string) bool {
+	if s.redis == nil {
+		return false
+	}
+	stopKey := RedisKeyStop + userKey
+	deleted, err := s.redis.Del(ctx, stopKey).Result()
+	if err != nil {
+		return false
+	}
+	return deleted > 0
+}
+
+// storeInflightMapping writes the (sessionID, assistantMessageID) to Redis so
+// that /stop on any instance can look it up and write to StreamManager.
+func (s *Service) storeInflightMapping(ctx context.Context, userKey, sessionID, messageID string) {
+	if s.redis == nil {
+		return
+	}
+	val := sessionID + ":" + messageID
+	if err := s.redis.Set(ctx, RedisKeyInflight+userKey, val, qaTimeout+30*time.Second).Err(); err != nil {
+		logger.Warnf(ctx, "[IM] Failed to store inflight mapping: %v", err)
+	}
+}
+
+// clearInflightMapping removes the inflight mapping from Redis.
+func (s *Service) clearInflightMapping(ctx context.Context, userKey string) {
+	if s.redis == nil {
+		return
+	}
+	s.redis.Del(ctx, RedisKeyInflight+userKey)
+}
+
+// loadInflightMapping retrieves (sessionID, messageID) from Redis.
+func (s *Service) loadInflightMapping(ctx context.Context, userKey string) (sessionID, messageID string, ok bool) {
+	if s.redis == nil {
+		return "", "", false
+	}
+	val, err := s.redis.Get(ctx, RedisKeyInflight+userKey).Result()
+	if err != nil {
+		return "", "", false
+	}
+	parts := strings.SplitN(val, ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+// writeStopEvent writes a stop event to StreamManager, matching the web
+// StopSession pattern. The QA watcher goroutine detects it and cancels.
+func (s *Service) writeStopEvent(ctx context.Context, sessionID, messageID string) {
+	stopEvt := interfaces.StreamEvent{
+		ID:        fmt.Sprintf("stop-%d", time.Now().UnixNano()),
+		Type:      types.ResponseType(event.EventStop),
+		Content:   "",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"session_id": sessionID,
+			"message_id": messageID,
+			"reason":     "user_requested",
+			"source":     "im",
+		},
+	}
+	if err := s.streamManager.AppendEvent(ctx, sessionID, messageID, stopEvt); err != nil {
+		logger.Warnf(ctx, "[IM] Failed to write stop event to StreamManager: %v", err)
+	}
+}
+
+// watchStreamManagerStop polls StreamManager for stop events and cancels the
+// QA context when one is detected. This is the IM equivalent of the web SSE
+// handler's stop detection loop. Exits when ctx is done.
+func (s *Service) watchStreamManagerStop(ctx context.Context, sessionID, messageID string, cancel context.CancelFunc) {
+	ticker := time.NewTicker(stopPollInterval)
+	defer ticker.Stop()
+
+	offset := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			events, newOffset, err := s.streamManager.GetEvents(ctx, sessionID, messageID, offset)
+			if err != nil {
+				continue
+			}
+			for _, evt := range events {
+				if evt.Type == types.ResponseType(event.EventStop) {
+					logger.Infof(ctx, "[IM] Stop event from StreamManager, cancelling: session=%s message=%s",
+						sessionID, messageID)
+					cancel()
+					return
+				}
+			}
+			offset = newOffset
+		}
 	}
 }
 
@@ -266,11 +681,47 @@ func (s *Service) GetChannelByIDAndTenant(channelID string, tenantID uint64) (*I
 	return &ch, nil
 }
 
+// isDuplicate checks if a message has already been processed.
+//
+// Multi-instance mode (Redis available): uses Redis SetNX for cross-instance
+// deduplication. If Redis fails, returns true (fail-closed) to prevent
+// duplicate processing across instances — a dropped message can be retried
+// by the user, but a duplicate LLM response wastes resources and confuses.
+//
+// Single-instance mode (no Redis): uses a local sync.Map, which is sufficient
+// when only one instance receives messages.
+func (s *Service) isDuplicate(ctx context.Context, messageID string) bool {
+	if s.redis != nil {
+		key := RedisKeyDedup + messageID
+		ok, err := s.redis.SetNX(ctx, key, "1", dedupTTL).Result()
+		if err == nil {
+			return !ok // SetNX returns true when key was newly set (not a duplicate)
+		}
+		// Redis is configured but failed — fail-closed to avoid cross-instance
+		// duplicate processing. The user can simply resend the message.
+		logger.Errorf(ctx, "[IM] Redis dedup failed (fail-closed, message dropped): %v", err)
+		return true
+	}
+	// Single-instance mode: local dedup is sufficient.
+	_, loaded := s.processedMsgs.LoadOrStore(messageID, time.Now())
+	return loaded
+}
+
 // HandleMessage processes an incoming IM message end-to-end using channel config.
 func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, channelID string) error {
+	ctx, span := tracing.ContextWithSpan(ctx, "im.HandleMessage")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("im.channel_id", channelID),
+		attribute.String("im.platform", string(msg.Platform)),
+		attribute.String("im.user_id", msg.UserID),
+		attribute.String("im.chat_id", msg.ChatID),
+		attribute.String("im.message_type", string(msg.MessageType)),
+	)
+
 	// Dedup: skip if this message was already processed (IM platforms may retry)
 	if msg.MessageID != "" {
-		if _, loaded := s.processedMsgs.LoadOrStore(msg.MessageID, time.Now()); loaded {
+		if s.isDuplicate(ctx, msg.MessageID) {
 			logger.Infof(ctx, "[IM] Skipping duplicate message: %s", msg.MessageID)
 			return nil
 		}
@@ -283,7 +734,7 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		msg.Content = string(contentRunes[:maxContentLength])
 	}
 
-	// Get channel config
+	// Get channel config (moved before rate limit so we can reply to the user)
 	adapter, channel, ok := s.GetChannelAdapter(channelID)
 	if !ok {
 		// Try loading from DB (channel might have been created after service start)
@@ -298,6 +749,22 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		adapter, channel, ok = s.GetChannelAdapter(channelID)
 		if !ok {
 			return fmt.Errorf("channel adapter not available after start: %s", channelID)
+		}
+	}
+
+	// Rate limit: enforce per-user sliding window to prevent abuse.
+	// Slash-commands (/stop, /clear, etc.) bypass rate limiting so the user
+	// always retains control over the bot even under heavy messaging.
+	isCommand := s.cmdRegistry.IsRegistered(msg.Content)
+	if !isCommand {
+		rateLimitKey := makeUserKey(channelID, msg.UserID, msg.ChatID)
+		if !s.rateLimiter.Allow(rateLimitKey) {
+			logger.Warnf(ctx, "[IM] Rate limited: channel=%s user=%s chat=%s", channelID, msg.UserID, msg.ChatID)
+			_ = adapter.SendReply(ctx, msg, &ReplyMessage{
+				Content: "您的消息发送过于频繁，请稍后再试。",
+				IsFinal: true,
+			})
+			return nil
 		}
 	}
 
@@ -330,13 +797,7 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		return fmt.Errorf("resolve session: %w", err)
 	}
 
-	// 3. Get the WeKnora session
-	session, err := s.sessionService.GetSession(sessionCtx, channelSession.SessionID)
-	if err != nil {
-		return fmt.Errorf("get session: %w", err)
-	}
-
-	// 4. Resolve custom agent (optional)
+	// 3. Resolve custom agent (optional)
 	var customAgent *types.CustomAgent
 	if agentID != "" {
 		agent, err := s.agentService.GetAgentByID(sessionCtx, agentID)
@@ -347,23 +808,123 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		}
 	}
 
-	// 5. Resolve knowledge base IDs from agent config
-	var kbIDs []string
-	if customAgent != nil {
-		kbIDs = customAgent.Config.KnowledgeBases
+	// ── Slash-command dispatch ──
+	// Commands are handled before the QA pipeline so they respond instantly.
+	if cmd, args, ok := s.cmdRegistry.Parse(msg.Content); ok {
+		return s.handleCommand(sessionCtx, cmd, args, msg, adapter, channel, channelSession, customAgent)
+	}
+	// Unrecognised slash-word: show help hint instead of sending to QA.
+	if LooksLikeCommand(msg.Content) {
+		_ = adapter.SendReply(ctx, msg, &ReplyMessage{
+			Content: "未知指令，发送 `/help` 查看所有可用指令。",
+			IsFinal: true,
+		})
+		return nil
 	}
 
-	// 6. If the adapter supports streaming and output_mode is not "full", use streaming
-	streamDisabled := channel.OutputMode == "full"
+	// 4. Get the WeKnora session
+	session, err := s.sessionService.GetSession(sessionCtx, channelSession.SessionID)
+	if err != nil {
+		return fmt.Errorf("get session: %w", err)
+	}
+
+	// 5. Enqueue the QA request into the bounded worker pool.
+	// The worker pool controls LLM concurrency and provides backpressure.
+	qaCtx, qaCancel := context.WithCancel(sessionCtx)
+	userKey := makeUserKey(channelID, msg.UserID, msg.ChatID)
+
+	req := &qaRequest{
+		ctx:       qaCtx,
+		cancel:    qaCancel,
+		msg:       msg,
+		session:   session,
+		agent:     customAgent,
+		adapter:   adapter,
+		channel:   channel,
+		channelID: channelID,
+		userKey:   userKey,
+	}
+
+	pos, enqueueErr := s.qaQueue.Enqueue(req)
+	if enqueueErr != nil {
+		qaCancel()
+		span.AddEvent("queue rejected", trace.WithAttributes(attribute.String("reason", enqueueErr.Error())))
+		logger.Warnf(ctx, "[IM] Queue rejected: user=%s reason=%v", msg.UserID, enqueueErr)
+		_ = adapter.SendReply(ctx, msg, &ReplyMessage{
+			Content: "当前排队人数较多，请稍后再试。",
+			IsFinal: true,
+		})
+		return nil
+	}
+
+	if pos > 0 {
+		logger.Infof(ctx, "[IM] Enqueued: user=%s pos=%d depth=%d", msg.UserID, pos, s.qaQueue.Metrics().Depth)
+		// In multi-instance mode the local queue position does not reflect global
+		// depth, so use a generic "queued" hint instead of an exact number.
+		queueMsg := fmt.Sprintf("收到，前面还有 %d 条消息在处理，请稍候 ⏳", pos)
+		if s.redis != nil {
+			queueMsg = "收到，当前排队中，请稍候 ⏳"
+		}
+		_ = adapter.SendReply(ctx, msg, &ReplyMessage{
+			Content: queueMsg,
+			IsFinal: true,
+		})
+	} else {
+		logger.Infof(ctx, "[IM] Enqueued: user=%s pos=0 (immediate)", msg.UserID)
+	}
+
+	return nil
+}
+
+// executeQARequest is the worker handler that runs the QA pipeline for a queued request.
+// It is called by qaQueue workers and must not block indefinitely.
+func (s *Service) executeQARequest(req *qaRequest) {
+	ctx, span := tracing.ContextWithSpan(req.ctx, "im.ExecuteQA")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("im.channel_id", req.channelID),
+		attribute.String("im.user_key", req.userKey),
+		attribute.String("im.user_id", req.msg.UserID),
+	)
+	defer req.cancel()
+
+	// Track in-flight request so /stop can cancel it.
+	entry := &inflightEntry{cancel: req.cancel}
+	s.inflight.Store(req.userKey, entry)
+	defer s.inflight.Delete(req.userKey)
+
+	// Check if a pre-execution /stop was issued while this request was queued.
+	if s.checkAndClearStopMarker(ctx, req.userKey) {
+		span.AddEvent("cancelled by remote /stop before execution")
+		logger.Infof(ctx, "[IM] Request cancelled by remote /stop before execution: %s", req.userKey)
+		return
+	}
+
+	// NOTE: StreamManager-based stop detection is started inside handleMessageStream /
+	// runQA after the assistant message is created (that's when we have the
+	// sessionID + messageID needed to poll StreamManager).
+
+	// kbIDs is left empty so the QA pipeline resolves them from the agent config.
+	var kbIDs []string
+
+	// Determine output mode from channel config.
+	streamDisabled := req.channel.OutputMode == "full"
+
+	// If the adapter supports streaming and output is not "full", use streaming.
 	if !streamDisabled {
-		if streamer, ok := adapter.(StreamSender); ok {
-			return s.handleMessageStream(sessionCtx, msg, session, customAgent, kbIDs, streamer, adapter)
+		if streamer, ok := req.adapter.(StreamSender); ok {
+			if err := s.handleMessageStream(ctx, req.msg, req.session, req.agent, kbIDs, streamer, req.adapter, req.userKey); err != nil {
+				span.SetStatus(codes.Error, err.Error())
+				logger.Errorf(ctx, "[IM] Stream QA failed: %v", err)
+			}
+			return
 		}
 	}
 
-	// Non-streaming fallback: collect full answer then send
-	answer, err := s.runQA(sessionCtx, session, msg.Content, customAgent, kbIDs)
+	// Non-streaming fallback: collect full answer then send.
+	answer, err := s.runQA(ctx, req.session, req.msg.Content, req.agent, kbIDs, req.userKey)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		logger.Errorf(ctx, "[IM] QA failed: %v, sending fallback reply", err)
 		answer = "抱歉，处理您的问题时出现了异常，请稍后再试。"
 	}
@@ -372,12 +933,150 @@ func (s *Service) HandleMessage(ctx context.Context, msg *IncomingMessage, chann
 		Content: answer,
 		IsFinal: true,
 	}
-	if err := adapter.SendReply(ctx, msg, reply); err != nil {
-		return fmt.Errorf("send reply: %w", err)
+	if err := req.adapter.SendReply(ctx, req.msg, reply); err != nil {
+		logger.Errorf(ctx, "[IM] Send reply failed: %v", err)
+		return
 	}
 
 	logger.Infof(ctx, "[IM] Reply sent: channel=%s platform=%s user=%s answer_len=%d",
-		channelID, msg.Platform, msg.UserID, len(answer))
+		req.channelID, req.msg.Platform, req.msg.UserID, len(answer))
+}
+
+// handleCommand executes a slash-command and sends the result back to the user.
+// It also handles side effects (ActionClear, ActionStop).
+func (s *Service) handleCommand(
+	ctx context.Context,
+	cmd Command,
+	args []string,
+	msg *IncomingMessage,
+	adapter Adapter,
+	channel *IMChannel,
+	channelSession *ChannelSession,
+	customAgent *types.CustomAgent,
+) error {
+	ctx, span := tracing.ContextWithSpan(ctx, "im.HandleCommand")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("im.command", cmd.Name()),
+		attribute.String("im.channel_id", channel.ID),
+		attribute.String("im.user_id", msg.UserID),
+	)
+
+	agentName := ""
+	if customAgent != nil {
+		agentName = customAgent.Name
+	}
+
+	cmdCtx := &CommandContext{
+		Incoming:          msg,
+		Session:           channelSession,
+		TenantID:          channel.TenantID,
+		AgentName:         agentName,
+		CustomAgent:       customAgent,
+		ChannelOutputMode: channel.OutputMode,
+	}
+
+	result, err := cmd.Execute(ctx, cmdCtx, args)
+	if err != nil {
+		logger.Errorf(ctx, "[IM] Command /%s error: %v", cmd.Name(), err)
+		_ = adapter.SendReply(ctx, msg, &ReplyMessage{
+			Content: "抱歉，执行指令时出现了异常，请稍后再试。",
+			IsFinal: true,
+		})
+		return err
+	}
+
+	// Handle service-level side effects.
+	switch result.Action {
+	case ActionClear:
+		// Soft-delete the current ChannelSession and clear the LLM context
+		// so the next message creates a completely fresh conversation.
+		if err := s.db.Model(&ChannelSession{}).
+			Where("id = ?", channelSession.ID).
+			Update("deleted_at", time.Now()).Error; err != nil {
+			logger.Warnf(ctx, "[IM] Failed to soft-delete channel session: %v", err)
+		}
+		if err := s.sessionService.ClearContext(ctx, channelSession.SessionID); err != nil {
+			logger.Warnf(ctx, "[IM] Failed to clear session context: %v", err)
+		}
+	case ActionStop:
+		inflightKey := makeUserKey(channel.ID, msg.UserID, msg.ChatID)
+
+		// 1. Try local cancel: remove from queue or cancel in-flight.
+		var localSessionID, localMessageID string
+		localStopped := s.qaQueue.Remove(inflightKey)
+		if localStopped {
+			logger.Infof(ctx, "[IM] Cancelled queued QA: key=%s", inflightKey)
+		} else if raw, loaded := s.inflight.LoadAndDelete(inflightKey); loaded {
+			e := raw.(*inflightEntry)
+			e.cancel()
+			localStopped = true
+			localSessionID = e.sessionID
+			localMessageID = e.assistantMessageID
+			logger.Infof(ctx, "[IM] Cancelled in-flight QA: key=%s", inflightKey)
+		}
+
+		// 2. Write stop event to StreamManager (same as web StopSession).
+		//    For local stop with known IDs, write directly.
+		//    For cross-instance, look up Redis inflight mapping to get IDs.
+		sessionID, messageID := localSessionID, localMessageID
+		if sessionID == "" || messageID == "" {
+			// Try cross-instance lookup.
+			sessionID, messageID, _ = s.loadInflightMapping(ctx, inflightKey)
+		}
+		if sessionID != "" && messageID != "" {
+			s.writeStopEvent(ctx, sessionID, messageID)
+			logger.Infof(ctx, "[IM] Wrote stop event to StreamManager: session=%s message=%s", sessionID, messageID)
+		}
+
+		// 3. Set Redis marker as fallback for requests not yet executing
+		//    (no assistant message yet → no StreamManager entry to poll).
+		if s.redis != nil {
+			s.redis.Set(ctx, RedisKeyStop+inflightKey, "1", stopMarkerTTL)
+		}
+
+		if !localStopped && sessionID == "" {
+			logger.Infof(ctx, "[IM] Set cross-instance stop marker (no inflight found): key=%s", inflightKey)
+		}
+	}
+
+	// Send the command reply, respecting the configured output mode.
+	sent := false
+	if channel.OutputMode != "full" {
+		if streamer, ok := adapter.(StreamSender); ok {
+			if err := s.sendStreamReply(ctx, msg, streamer, result.Content); err != nil {
+				logger.Warnf(ctx, "[IM] Stream reply for command /%s failed, falling back: %v", cmd.Name(), err)
+			} else {
+				sent = true
+			}
+		}
+	}
+	if !sent {
+		_ = adapter.SendReply(ctx, msg, &ReplyMessage{
+			Content: result.Content,
+			IsFinal: true,
+		})
+	}
+
+	logger.Infof(ctx, "[IM] Command /%s executed: channel=%s user=%s action=%d",
+		cmd.Name(), channel.ID, msg.UserID, result.Action)
+	return nil
+}
+
+// sendStreamReply sends a complete content string via the streaming interface
+// (StartStream → SendStreamChunk → EndStream). This is used for command replies
+// when the output mode is set to "stream", so they visually match QA responses.
+func (s *Service) sendStreamReply(ctx context.Context, msg *IncomingMessage, streamer StreamSender, content string) error {
+	streamID, err := streamer.StartStream(ctx, msg)
+	if err != nil {
+		return fmt.Errorf("start stream: %w", err)
+	}
+	if err := streamer.SendStreamChunk(ctx, msg, streamID, content); err != nil {
+		return fmt.Errorf("send stream chunk: %w", err)
+	}
+	if err := streamer.EndStream(ctx, msg, streamID); err != nil {
+		return fmt.Errorf("end stream: %w", err)
+	}
 	return nil
 }
 
@@ -426,8 +1125,14 @@ func (s *Service) resolveSession(ctx context.Context, msg *IncomingMessage, tena
 		IMChannelID: imChannelID,
 	}
 	if err := s.db.Create(&cs).Error; err != nil {
-		// If the insert failed due to unique constraint (concurrent request),
-		// fetch the existing record.
+		// The insert failed (likely unique constraint from a concurrent request on
+		// another instance). Clean up the orphaned Session we just created — it has
+		// no messages yet, so a direct delete is safe.
+		if delErr := s.db.Where("id = ?", createdSession.ID).Delete(createdSession).Error; delErr != nil {
+			logger.Warnf(ctx, "[IM] Failed to clean up orphaned session %s: %v", createdSession.ID, delErr)
+		}
+
+		// Fetch the existing ChannelSession created by the winning instance.
 		var existing ChannelSession
 		if findErr := s.db.Where("platform = ? AND user_id = ? AND chat_id = ? AND tenant_id = ? AND deleted_at IS NULL",
 			string(msg.Platform), msg.UserID, msg.ChatID, tenantID).
@@ -543,12 +1248,19 @@ func briefToolSummary(output string) string {
 // handleMessageStream runs the QA pipeline and streams answer chunks to the IM platform
 // in real-time via the StreamSender interface. Chunks are batched at streamFlushInterval
 // to avoid API rate-limiting.
-func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, streamer StreamSender, adapter Adapter) error {
+func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, streamer StreamSender, adapter Adapter, userKey string) error {
+	ctx, span := tracing.ContextWithSpan(ctx, "im.StreamQA")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("im.user_id", msg.UserID),
+		attribute.String("im.platform", string(msg.Platform)),
+	)
+
 	// Start the stream on the IM platform (e.g., create Feishu streaming card)
 	streamID, err := streamer.StartStream(ctx, msg)
 	if err != nil {
 		logger.Warnf(ctx, "[IM] StartStream failed, falling back to non-streaming: %v", err)
-		return s.fallbackNonStream(ctx, msg, session, customAgent, kbIDs, adapter)
+		return s.fallbackNonStream(ctx, msg, session, customAgent, kbIDs, adapter, userKey)
 	}
 
 	// Prepare the QA pipeline
@@ -576,6 +1288,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 		// (across flush boundaries) was '\n'. This lets ensureNewlineBefore
 		// work correctly even after buf has been Reset by a flush.
 		lastCharNewline = true
+		streamedAny     bool // whether any user-visible content was written to buf
 	)
 	closeDone := func() { closeOnce.Do(func() { close(done) }) }
 
@@ -625,6 +1338,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 		}
 
 		bufWrite(data.Content)
+		streamedAny = true
 		bufMu.Unlock()
 
 		if data.Done {
@@ -724,6 +1438,20 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 		return fmt.Errorf("create assistant message: %w", err)
 	}
 
+	// Register inflight mapping so cross-instance /stop can find this request
+	// and write a stop event to StreamManager.
+	if raw, ok := s.inflight.Load(userKey); ok {
+		e := raw.(*inflightEntry)
+		e.sessionID = session.ID
+		e.assistantMessageID = assistantMsg.ID
+	}
+	s.storeInflightMapping(qaCtx, userKey, session.ID, assistantMsg.ID)
+	defer s.clearInflightMapping(ctx, userKey)
+
+	// Start StreamManager stop watcher — mirrors web's handleAgentEventsForSSE
+	// stop detection. Cancels qaCtx if a stop event is written by any instance.
+	go s.watchStreamManagerStop(qaCtx, session.ID, assistantMsg.ID, qaCancel)
+
 	// Run QA async
 	go func() {
 		var err error
@@ -774,20 +1502,33 @@ loop:
 	// Final flush of any remaining content
 	flush()
 
+	// If no user-visible content was streamed (e.g., the entire response was
+	// in <think> blocks, or the QA pipeline errored), send a fallback message
+	// as the last chunk so the Feishu card doesn't end up empty.
+	bufMu.Lock()
+	answer := answerBuilder.String()
+	finalErr := qaErr
+	noVisibleContent := !streamedAny
+	bufMu.Unlock()
+
+	if noVisibleContent {
+		fallback := "抱歉，我暂时无法回答这个问题。"
+		if finalErr != nil {
+			fallback = "抱歉，处理您的问题时出现了异常，请稍后再试。"
+		}
+		if err := streamer.SendStreamChunk(ctx, msg, streamID, fallback); err != nil {
+			logger.Warnf(ctx, "[IM] SendStreamChunk fallback failed: %v", err)
+		}
+		if answer == "" {
+			answer = fallback
+		}
+	}
+
 	// End the stream
 	if err := streamer.EndStream(ctx, msg, streamID); err != nil {
 		logger.Warnf(ctx, "[IM] EndStream failed: %v", err)
 	}
 
-	// Persist the full answer
-	bufMu.Lock()
-	answer := answerBuilder.String()
-	finalErr := qaErr
-	bufMu.Unlock()
-
-	if answer == "" && finalErr != nil {
-		answer = "抱歉，处理您的问题时出现了异常，请稍后再试。"
-	}
 	if answer == "" {
 		answer = "抱歉，我暂时无法回答这个问题。"
 	}
@@ -803,8 +1544,8 @@ loop:
 }
 
 // fallbackNonStream is used when streaming initialization fails.
-func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, adapter Adapter) error {
-	answer, err := s.runQA(ctx, session, msg.Content, customAgent, kbIDs)
+func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, session *types.Session, customAgent *types.CustomAgent, kbIDs []string, adapter Adapter, userKey string) error {
+	answer, err := s.runQA(ctx, session, msg.Content, customAgent, kbIDs, userKey)
 	if err != nil {
 		logger.Errorf(ctx, "[IM] QA fallback failed: %v", err)
 		answer = "抱歉，处理您的问题时出现了异常，请稍后再试。"
@@ -814,7 +1555,7 @@ func (s *Service) fallbackNonStream(ctx context.Context, msg *IncomingMessage, s
 }
 
 // runQA executes the WeKnora QA pipeline and returns the full answer text.
-func (s *Service) runQA(ctx context.Context, session *types.Session, query string, customAgent *types.CustomAgent, kbIDs []string) (string, error) {
+func (s *Service) runQA(ctx context.Context, session *types.Session, query string, customAgent *types.CustomAgent, kbIDs []string, userKey string) (string, error) {
 	// Add timeout to prevent indefinite blocking
 	ctx, cancel := context.WithTimeout(ctx, qaTimeout)
 	defer cancel()
@@ -886,6 +1627,18 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 	if err != nil {
 		return "", fmt.Errorf("create assistant message: %w", err)
 	}
+
+	// Register inflight mapping for cross-instance /stop via StreamManager.
+	if raw, ok := s.inflight.Load(userKey); ok {
+		e := raw.(*inflightEntry)
+		e.sessionID = session.ID
+		e.assistantMessageID = assistantMsg.ID
+	}
+	s.storeInflightMapping(ctx, userKey, session.ID, assistantMsg.ID)
+	defer s.clearInflightMapping(ctx, userKey)
+
+	// Start StreamManager stop watcher.
+	go s.watchStreamManagerStop(ctx, session.ID, assistantMsg.ID, cancel)
 
 	// Run QA async
 	go func() {
@@ -1434,20 +2187,20 @@ func (s *Service) watchAndSendSummary(
 			case types.ParseStatusCompleted:
 				// Parsing done. If summary generation is in progress, wait for it.
 				switch knowledge.SummaryStatus {
-			case types.SummaryStatusNone, "":
-				// No summary task configured. For image files the VLM caption
-				// is stored in Description by finalizeImageKnowledge, so we
-				// still show it if present.
-				if knowledge.Description != "" && knowledge.Description != fileName {
-				_ = s.sendSmartReply(ctx, adapter, msg, channel,
-					fmt.Sprintf("用户之前上传的文件「%s」已解析完成。以下是文件的完整摘要内容：\n%s\n\n请生成一条通知消息，包含：1) 告知文件已解析完成；2) 用 Markdown 格式（标题、列表、加粗等）结构化展示上述摘要内容，不要删减或概括；3) 提示用户可以针对该文件提问。", fileName, knowledge.Description),
-					fmt.Sprintf("📄 文件「%s」已解析完成。\n\n**摘要：**\n\n%s\n\n---\n可以针对该文件进行提问。", fileName, knowledge.Description))
-				} else {
-					_ = s.sendSmartReply(ctx, adapter, msg, channel,
-						fmt.Sprintf("用户之前上传的文件「%s」已解析完成，现在可以开始针对该文件进行提问了。", fileName),
-						fmt.Sprintf("📄 文件「%s」已解析完成，可以开始提问了！", fileName))
-				}
-				return
+				case types.SummaryStatusNone, "":
+					// No summary task configured. For image files the VLM caption
+					// is stored in Description by finalizeImageKnowledge, so we
+					// still show it if present.
+					if knowledge.Description != "" && knowledge.Description != fileName {
+						_ = s.sendSmartReply(ctx, adapter, msg, channel,
+							fmt.Sprintf("用户之前上传的文件「%s」已解析完成。以下是文件的完整摘要内容：\n%s\n\n请生成一条通知消息，包含：1) 告知文件已解析完成；2) 用 Markdown 格式（标题、列表、加粗等）结构化展示上述摘要内容，不要删减或概括；3) 提示用户可以针对该文件提问。", fileName, knowledge.Description),
+							fmt.Sprintf("📄 文件「%s」已解析完成。\n\n**摘要：**\n\n%s\n\n---\n可以针对该文件进行提问。", fileName, knowledge.Description))
+					} else {
+						_ = s.sendSmartReply(ctx, adapter, msg, channel,
+							fmt.Sprintf("用户之前上传的文件「%s」已解析完成，现在可以开始针对该文件进行提问了。", fileName),
+							fmt.Sprintf("📄 文件「%s」已解析完成，可以开始提问了！", fileName))
+					}
+					return
 
 				case types.SummaryStatusCompleted:
 					// Summary is ready — send it
