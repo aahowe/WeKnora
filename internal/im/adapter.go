@@ -11,9 +11,11 @@ import (
 type Platform string
 
 const (
-	PlatformWeCom  Platform = "wecom"
-	PlatformFeishu Platform = "feishu"
-	PlatformSlack  Platform = "slack"
+	PlatformWeCom    Platform = "wecom"
+	PlatformFeishu   Platform = "feishu"
+	PlatformSlack    Platform = "slack"
+	PlatformTelegram Platform = "telegram"
+	PlatformDingtalk Platform = "dingtalk"
 )
 
 // MessageType identifies the kind of IM message.

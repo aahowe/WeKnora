@@ -54,8 +54,10 @@ import (
 	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/handler/session"
 	imPkg "github.com/Tencent/WeKnora/internal/im"
+	"github.com/Tencent/WeKnora/internal/im/dingtalk"
 	"github.com/Tencent/WeKnora/internal/im/feishu"
 	"github.com/Tencent/WeKnora/internal/im/slack"
+	"github.com/Tencent/WeKnora/internal/im/telegram"
 	"github.com/Tencent/WeKnora/internal/im/wecom"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -1091,6 +1093,83 @@ func registerIMAdapterFactories(imService *imPkg.Service) {
 
 		default:
 			return nil, nil, fmt.Errorf("unsupported slack mode: %s", mode)
+		}
+	})
+
+	// Register Telegram adapter factory
+	imService.RegisterAdapterFactory("telegram", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
+		creds, err := parseCredentials(channel.Credentials)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse telegram credentials: %w", err)
+		}
+
+		botToken := getString(creds, "bot_token")
+
+		mode := channel.Mode
+		if mode == "" {
+			mode = "websocket"
+		}
+
+		switch mode {
+		case "webhook":
+			secretToken := getString(creds, "secret_token")
+			adapter := telegram.NewWebhookAdapter(botToken, secretToken)
+			return adapter, nil, nil
+
+		case "websocket":
+			client := telegram.NewLongConnClient(botToken, msgHandler)
+
+			wsCtx, wsCancel := context.WithCancel(context.Background())
+			go func() {
+				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
+					logger.Errorf(context.Background(), "[IM] Telegram long polling stopped for channel %s: %v", channel.ID, err)
+				}
+			}()
+
+			adapter := telegram.NewAdapter(client, botToken)
+			return adapter, wsCancel, nil
+
+		default:
+			return nil, nil, fmt.Errorf("unsupported telegram mode: %s", mode)
+		}
+	})
+
+	// Register DingTalk adapter factory
+	imService.RegisterAdapterFactory("dingtalk", func(factoryCtx context.Context, channel *imPkg.IMChannel, msgHandler func(context.Context, *imPkg.IncomingMessage) error) (imPkg.Adapter, context.CancelFunc, error) {
+		creds, err := parseCredentials(channel.Credentials)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse dingtalk credentials: %w", err)
+		}
+
+		clientID := getString(creds, "client_id")
+		clientSecret := getString(creds, "client_secret")
+		cardTemplateID := getString(creds, "card_template_id")
+
+		mode := channel.Mode
+		if mode == "" {
+			mode = "websocket"
+		}
+
+		switch mode {
+		case "webhook":
+			adapter := dingtalk.NewWebhookAdapter(clientID, clientSecret, cardTemplateID)
+			return adapter, nil, nil
+
+		case "websocket":
+			client := dingtalk.NewLongConnClient(clientID, clientSecret, msgHandler)
+
+			wsCtx, wsCancel := context.WithCancel(context.Background())
+			go func() {
+				if err := client.Start(wsCtx); err != nil && wsCtx.Err() == nil {
+					logger.Errorf(context.Background(), "[IM] DingTalk stream stopped for channel %s: %v", channel.ID, err)
+				}
+			}()
+
+			adapter := dingtalk.NewAdapter(client, clientID, clientSecret, cardTemplateID)
+			return adapter, wsCancel, nil
+
+		default:
+			return nil, nil, fmt.Errorf("unsupported dingtalk mode: %s", mode)
 		}
 	})
 

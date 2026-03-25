@@ -1468,6 +1468,10 @@ export default {
           label: "NVIDIA",
           description: "deepseek-ai-deepseek-v3_1, nv-embed-v1, rerank-qa-mistral-4b, etc.",
         },
+        novita: {
+          label: "Novita AI",
+          description: "moonshotai/kimi-k2.5, zai-org/glm-5, minimax/minimax-m2.5, qwen/qwen3-embedding-0.6b, etc.",
+        },
       }
     },
     builtinTag: 'Built-in'
@@ -2841,10 +2845,12 @@ export default {
     },
     im: {
       title: 'Интеграция IM',
-      description: 'Подключите агента к платформам мгновенных сообщений, таким как WeCom, Feishu и Slack',
+      description: 'Подключите агента к платформам мгновенных сообщений, таким как WeCom, Feishu, Slack, Telegram и DingTalk',
       wecom: 'WeCom',
       feishu: 'Feishu',
       slack: 'Slack',
+      telegram: 'Telegram',
+      dingtalk: 'DingTalk',
       addChannel: 'Добавить канал',
       editChannel: 'Редактировать канал',
       deleteConfirm: 'Вы уверены, что хотите удалить этот канал? Это действие не может быть отменено.',
@@ -2862,6 +2868,10 @@ export default {
       wecomConsole: 'Консоль WeCom',
       feishuConsole: 'Платформа Feishu',
       slackConsole: 'Консоль Slack API',
+      telegramConsole: 'Telegram BotFather',
+      dingtalkConsole: 'Платформа DingTalk',
+      dingtalkCardTemplateId: 'ID шаблона карточки (необязательно)',
+      dingtalkCardTemplateIdHint: 'Создайте шаблон AI-карточки на open-dev.dingtalk.com/fe/card для потоковой передачи с эффектом печатной машинки',
       modeHint: 'Рекомендуется WebSocket — проще настроить',
       consoleTip: 'для получения учётных данных',
       fileKnowledgeBase: 'База знаний для файлов',
