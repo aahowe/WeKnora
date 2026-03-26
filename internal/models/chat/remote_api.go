@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/provider"
@@ -15,6 +16,18 @@ import (
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/sashabaranov/go-openai"
 )
+
+// rawHTTPClient is a shared HTTP client for raw HTTP LLM calls with connection-level timeouts.
+// No overall Timeout is set so streaming calls are controlled by context cancellation only.
+// Uses SSRFSafeDialContext to prevent DNS rebinding attacks at the connection layer.
+var rawHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:         secutils.SSRFSafeDialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConnsPerHost: 5,
+	},
+}
 
 // RemoteAPIChat 实现了基于 OpenAI 兼容 API 的聊天
 // 这是一个通用实现，不包含任何 provider 特定的逻辑
@@ -37,6 +50,12 @@ type RemoteAPIChat struct {
 
 // NewRemoteAPIChat 创建远程 API 聊天实例
 func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
+	if chatConfig.BaseURL != "" {
+		if err := secutils.ValidateURLForSSRF(chatConfig.BaseURL); err != nil {
+			return nil, fmt.Errorf("baseURL SSRF check failed: %w", err)
+		}
+	}
+
 	apiKey := chatConfig.APIKey
 	config := openai.DefaultConfig(apiKey)
 	if baseURL := chatConfig.BaseURL; baseURL != "" {
@@ -152,6 +171,10 @@ func (c *RemoteAPIChat) BuildChatCompletionRequest(messages []Message, opts *Cha
 		Stream:   isStream,
 	}
 
+	if isStream {
+		req.StreamOptions = &openai.StreamOptions{IncludeUsage: true}
+	}
+
 	if opts != nil {
 		if opts.Temperature > 0 {
 			req.Temperature = float32(opts.Temperature)
@@ -189,6 +212,11 @@ func (c *RemoteAPIChat) BuildChatCompletionRequest(messages []Message, opts *Cha
 				}
 				req.Tools = append(req.Tools, openaiTool)
 			}
+		}
+
+		// 处理 ParallelToolCalls
+		if opts.ParallelToolCalls != nil {
+			req.ParallelToolCalls = *opts.ParallelToolCalls
 		}
 
 		// 处理 ToolChoice（标准实现）
@@ -273,6 +301,9 @@ func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, cu
 	if endpoint == "" {
 		endpoint = c.baseURL + "/chat/completions"
 	}
+	if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
+		return nil, fmt.Errorf("endpoint SSRF check failed: %w", err)
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -281,8 +312,7 @@ func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, cu
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 
-	client := &http.Client{}
-	resp, err := client.Do(httpReq)
+	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("send request: %w", err)
 	}
@@ -316,11 +346,7 @@ func (c *RemoteAPIChat) parseCompletionResponse(resp *openai.ChatCompletionRespo
 	response := &types.ChatResponse{
 		Content:      content,
 		FinishReason: string(choice.FinishReason),
-		Usage: struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		}{
+		Usage: types.TokenUsage{
 			PromptTokens:     resp.Usage.PromptTokens,
 			CompletionTokens: resp.Usage.CompletionTokens,
 			TotalTokens:      resp.Usage.TotalTokens,
@@ -421,6 +447,9 @@ func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint stri
 	if endpoint == "" {
 		endpoint = c.baseURL + "/chat/completions"
 	}
+	if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
+		return nil, fmt.Errorf("endpoint SSRF check failed: %w", err)
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -430,8 +459,7 @@ func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint stri
 	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	httpReq.Header.Set("Accept", "text/event-stream")
 
-	client := &http.Client{}
-	resp, err := client.Do(httpReq)
+	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("send request: %w", err)
 	}
@@ -459,12 +487,13 @@ func (c *RemoteAPIChat) processStream(ctx context.Context, stream *openai.ChatCo
 	for {
 		response, err := stream.Recv()
 		if err != nil {
-			if err.Error() == "EOF" {
+			if err == io.EOF {
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Content:      "",
 					Done:         true,
 					ToolCalls:    state.buildOrderedToolCalls(),
+					Usage:        state.usage,
 				}
 			} else {
 				streamChan <- types.StreamResponse{
@@ -474,6 +503,14 @@ func (c *RemoteAPIChat) processStream(ctx context.Context, stream *openai.ChatCo
 				}
 			}
 			return
+		}
+
+		if response.Usage != nil {
+			state.usage = &types.TokenUsage{
+				PromptTokens:     response.Usage.PromptTokens,
+				CompletionTokens: response.Usage.CompletionTokens,
+				TotalTokens:      response.Usage.TotalTokens,
+			}
 		}
 
 		if len(response.Choices) > 0 {
@@ -493,7 +530,7 @@ func (c *RemoteAPIChat) processRawHTTPStream(ctx context.Context, resp *http.Res
 	for {
 		event, err := reader.ReadEvent()
 		if err != nil {
-			if err.Error() != "EOF" {
+			if err != io.EOF {
 				logger.Errorf(ctx, "Stream read error: %v", err)
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeError,
@@ -514,6 +551,7 @@ func (c *RemoteAPIChat) processRawHTTPStream(ctx context.Context, resp *http.Res
 				Content:      "",
 				Done:         true,
 				ToolCalls:    state.buildOrderedToolCalls(),
+				Usage:        state.usage,
 			}
 			return
 		}
@@ -538,6 +576,14 @@ func (c *RemoteAPIChat) processRawHTTPStream(ctx context.Context, resp *http.Res
 		if err := json.Unmarshal(event.Data, &streamResp); err != nil {
 			logger.Errorf(ctx, "Failed to parse stream response: %v", err)
 			continue
+		}
+
+		if streamResp.Usage != nil {
+			state.usage = &types.TokenUsage{
+				PromptTokens:     streamResp.Usage.PromptTokens,
+				CompletionTokens: streamResp.Usage.CompletionTokens,
+				TotalTokens:      streamResp.Usage.TotalTokens,
+			}
 		}
 
 		if len(streamResp.Choices) > 0 {
@@ -566,6 +612,7 @@ type streamState struct {
 	nameNotified     map[int]bool
 	hasThinking      bool
 	fieldExtractors  map[int]*jsonFieldExtractor // per tool-call-index extractors for streaming field extraction
+	usage            *types.TokenUsage           // captured from the final stream chunk when include_usage is enabled
 }
 
 func newStreamState() *streamState {
@@ -601,7 +648,7 @@ func (c *RemoteAPIChat) processStreamDelta(ctx context.Context, choice *openai.C
 
 	// 处理 tool calls
 	if len(delta.ToolCalls) > 0 {
-		c.processToolCallsDelta(delta.ToolCalls, state, streamChan)
+		c.processToolCallsDelta(ctx, delta.ToolCalls, state, streamChan)
 	}
 
 	// 发送思考内容（ReasoningContent，支持 DeepSeek 等模型）
@@ -642,10 +689,21 @@ func (c *RemoteAPIChat) processStreamDelta(ctx context.Context, choice *openai.C
 			ToolCalls:    state.buildOrderedToolCalls(),
 		}
 	}
+
+	// Ensure thinking done is sent when stream finishes without any answer content
+	// (e.g., model only produced reasoning then hit finish_reason with empty content).
+	if isDone && state.hasThinking {
+		streamChan <- types.StreamResponse{
+			ResponseType: types.ResponseTypeThinking,
+			Content:      "",
+			Done:         true,
+		}
+		state.hasThinking = false
+	}
 }
 
 // processToolCallsDelta 处理 tool calls 的增量更新
-func (c *RemoteAPIChat) processToolCallsDelta(toolCalls []openai.ToolCall, state *streamState, streamChan chan types.StreamResponse) {
+func (c *RemoteAPIChat) processToolCallsDelta(ctx context.Context, toolCalls []openai.ToolCall, state *streamState, streamChan chan types.StreamResponse) {
 	for _, tc := range toolCalls {
 		var toolCallIndex int
 		if tc.Index != nil {
@@ -705,6 +763,12 @@ func (c *RemoteAPIChat) processToolCallsDelta(toolCalls []openai.ToolCall, state
 			if !exists {
 				extractor = newJSONFieldExtractor("answer")
 				state.fieldExtractors[toolCallIndex] = extractor
+				// Detect non-incremental arrival: if the first args chunk is large,
+				// the model likely returned all arguments at once (non-streaming tool call)
+				if len(tc.Function.Arguments) > 200 {
+					logger.Warnf(ctx, "[LLM Stream] final_answer args arrived in large chunk (%d bytes), "+
+						"model may not support incremental tool call streaming", len(tc.Function.Arguments))
+				}
 			}
 			answerChunk := extractor.Feed(tc.Function.Arguments)
 			if answerChunk != "" {

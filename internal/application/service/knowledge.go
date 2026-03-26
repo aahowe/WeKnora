@@ -178,9 +178,16 @@ func checkStorageEngineConfigured(ctx context.Context, kb *types.KnowledgeBase) 
 	return nil
 }
 
+func defaultChannel(ch string) string {
+	if ch == "" {
+		return types.ChannelWeb
+	}
+	return ch
+}
+
 // CreateKnowledgeFromFile creates a knowledge entry from an uploaded file
 func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
-	kbID string, file *multipart.FileHeader, metadata map[string]string, enableMultimodel *bool, customFileName string, tagID string,
+	kbID string, file *multipart.FileHeader, metadata map[string]string, enableMultimodel *bool, customFileName string, tagID string, channel string,
 ) (*types.Knowledge, error) {
 	logger.Info(ctx, "Start creating knowledge from file")
 
@@ -322,6 +329,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		KnowledgeBaseID:  kbID,
 		TagID:            tagID, // 设置分类ID，用于知识分类管理
 		Type:             "file",
+		Channel:          defaultChannel(channel),
 		Title:            safeFilename,
 		FileName:         safeFilename,
 		FileType:         getFileType(safeFilename),
@@ -434,14 +442,14 @@ func isFileURL(rawURL, fileName, fileType string) bool {
 }
 
 func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
-	kbID string, rawURL string, fileName string, fileType string, enableMultimodel *bool, title string, tagID string,
+	kbID string, rawURL string, fileName string, fileType string, enableMultimodel *bool, title string, tagID string, channel string,
 ) (*types.Knowledge, error) {
 	logger.Info(ctx, "Start creating knowledge from URL")
 	logger.Infof(ctx, "Knowledge base ID: %s, URL: %s", kbID, rawURL)
 
 	// Route to file_url logic when the URL points to a downloadable file
 	if isFileURL(rawURL, fileName, fileType) {
-		return s.createKnowledgeFromFileURL(ctx, kbID, rawURL, fileName, fileType, enableMultimodel, title, tagID)
+		return s.createKnowledgeFromFileURL(ctx, kbID, rawURL, fileName, fileType, enableMultimodel, title, tagID, channel)
 	}
 
 	url := rawURL
@@ -510,8 +518,10 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 		TenantID:         tenantID,
 		KnowledgeBaseID:  kbID,
 		Type:             "url",
+		Channel:          defaultChannel(channel),
 		Title:            title,
 		Source:           url,
+		FileType:         "html",
 		FileHash:         fileHash,
 		ParseStatus:      "pending",
 		EnableStatus:     "disabled",
@@ -628,6 +638,7 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 	enableMultimodel *bool,
 	title string,
 	tagID string,
+	channel string,
 ) (*types.Knowledge, error) {
 	logger.Info(ctx, "Start creating knowledge from file URL")
 	logger.Infof(ctx, "Knowledge base ID: %s, file URL: %s", kbID, fileURL)
@@ -720,6 +731,7 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		TenantID:         tenantID,
 		KnowledgeBaseID:  kbID,
 		Type:             "file_url",
+		Channel:          defaultChannel(channel),
 		Title:            title,
 		FileName:         displayName,
 		FileType:         fileType,
@@ -790,21 +802,21 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 
 // CreateKnowledgeFromPassage creates a knowledge entry from text passages
 func (s *knowledgeService) CreateKnowledgeFromPassage(ctx context.Context,
-	kbID string, passage []string,
+	kbID string, passage []string, channel string,
 ) (*types.Knowledge, error) {
-	return s.createKnowledgeFromPassageInternal(ctx, kbID, passage, false)
+	return s.createKnowledgeFromPassageInternal(ctx, kbID, passage, false, channel)
 }
 
 // CreateKnowledgeFromPassageSync creates a knowledge entry from text passages and waits for indexing to complete.
 func (s *knowledgeService) CreateKnowledgeFromPassageSync(ctx context.Context,
-	kbID string, passage []string,
+	kbID string, passage []string, channel string,
 ) (*types.Knowledge, error) {
-	return s.createKnowledgeFromPassageInternal(ctx, kbID, passage, true)
+	return s.createKnowledgeFromPassageInternal(ctx, kbID, passage, true, channel)
 }
 
 // CreateKnowledgeFromManual creates or saves manual Markdown knowledge content.
 func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
-	kbID string, payload *types.ManualKnowledgePayload,
+	kbID string, payload *types.ManualKnowledgePayload, channel string,
 ) (*types.Knowledge, error) {
 	logger.Info(ctx, "Start creating manual knowledge entry")
 
@@ -857,6 +869,7 @@ func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
 		TenantID:         tenantID,
 		KnowledgeBaseID:  kbID,
 		Type:             types.KnowledgeTypeManual,
+		Channel:          defaultChannel(channel),
 		Title:            title,
 		Description:      "",
 		Source:           types.KnowledgeTypeManual,
@@ -901,7 +914,7 @@ func (s *knowledgeService) CreateKnowledgeFromManual(ctx context.Context,
 // createKnowledgeFromPassageInternal consolidates the common logic for creating knowledge from passages.
 // When syncMode is true, chunk processing is performed synchronously; otherwise, it's processed asynchronously.
 func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Context,
-	kbID string, passage []string, syncMode bool,
+	kbID string, passage []string, syncMode bool, channel string,
 ) (*types.Knowledge, error) {
 	if syncMode {
 		logger.Info(ctx, "Start creating knowledge from passage (sync)")
@@ -940,6 +953,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 		TenantID:         ctx.Value(types.TenantIDContextKey).(uint64),
 		KnowledgeBaseID:  kbID,
 		Type:             "passage",
+		Channel:          defaultChannel(channel),
 		ParseStatus:      "pending",
 		EnableStatus:     "disabled",
 		CreatedAt:        time.Now(),
@@ -1271,6 +1285,7 @@ func (s *knowledgeService) cloneKnowledge(
 		TenantID:         targetKB.TenantID,
 		KnowledgeBaseID:  targetKB.ID,
 		Type:             src.Type,
+		Channel:          src.Channel,
 		Title:            src.Title,
 		Description:      src.Description,
 		Source:           src.Source,
@@ -1344,7 +1359,15 @@ func (s *knowledgeService) processDocumentFromPassage(ctx context.Context,
 		start = end
 	}
 	// Process and store chunks
-	s.processChunks(ctx, kb, knowledge, chunks)
+	var opts ProcessChunksOptions
+	if kb.QuestionGenerationConfig != nil && kb.QuestionGenerationConfig.Enabled {
+		opts.EnableQuestionGeneration = true
+		opts.QuestionCount = kb.QuestionGenerationConfig.QuestionCount
+		if opts.QuestionCount <= 0 {
+			opts.QuestionCount = 3
+		}
+	}
+	s.processChunks(ctx, kb, knowledge, chunks, opts)
 }
 
 // ProcessChunksOptions contains options for processing chunks
@@ -1910,11 +1933,13 @@ func (s *knowledgeService) enqueueQuestionGenerationTask(ctx context.Context,
 	kbID, knowledgeID string, questionCount int,
 ) {
 	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
+	lang, _ := types.LanguageFromContext(ctx)
 	payload := types.QuestionGenerationPayload{
 		TenantID:        tenantID,
 		KnowledgeBaseID: kbID,
 		KnowledgeID:     knowledgeID,
 		QuestionCount:   questionCount,
+		Language:        lang,
 	}
 
 	payloadBytes, err := json.Marshal(payload)
@@ -2160,6 +2185,14 @@ func (s *knowledgeService) ProcessQuestionGeneration(ctx context.Context, t *asy
 
 	// Set tenant context
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
+	if payload.Language != "" {
+		ctx = context.WithValue(ctx, types.LanguageContextKey, payload.Language)
+	}
+
+	if strings.TrimSpace(s.config.Conversation.GenerateQuestionsPrompt) == "" {
+		logger.Errorf(ctx, "GenerateQuestionsPrompt is empty: configure conversation.generate_questions_prompt_id")
+		return fmt.Errorf("generate questions prompt not configured")
+	}
 
 	// Get knowledge base
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, payload.KnowledgeBaseID)
@@ -2324,10 +2357,9 @@ func (s *knowledgeService) generateQuestionsWithContext(ctx context.Context,
 		return nil, nil
 	}
 
-	// Build prompt with context
-	prompt := s.config.Conversation.GenerateQuestionsPrompt
+	prompt := strings.TrimSpace(s.config.Conversation.GenerateQuestionsPrompt)
 	if prompt == "" {
-		prompt = defaultQuestionGenerationPrompt
+		return nil, fmt.Errorf("generate questions prompt not configured")
 	}
 
 	// Build context section
@@ -2343,11 +2375,14 @@ func (s *knowledgeService) generateQuestionsWithContext(ctx context.Context,
 		contextSection += "\n"
 	}
 
-	// Replace placeholders
-	prompt = strings.ReplaceAll(prompt, "{{question_count}}", fmt.Sprintf("%d", questionCount))
-	prompt = strings.ReplaceAll(prompt, "{{content}}", content)
-	prompt = strings.ReplaceAll(prompt, "{{context}}", contextSection)
-	prompt = strings.ReplaceAll(prompt, "{{doc_name}}", docName)
+	langName := types.LanguageNameFromContext(ctx)
+	prompt = types.RenderPromptPlaceholders(prompt, types.PlaceholderValues{
+		"question_count": fmt.Sprintf("%d", questionCount),
+		"content":        content,
+		"context":        contextSection,
+		"doc_name":       docName,
+		"language":       langName,
+	})
 
 	thinking := false
 	response, err := chatModel.Chat(ctx, []chat.Message{
@@ -2384,40 +2419,6 @@ func (s *knowledgeService) generateQuestionsWithContext(ctx context.Context,
 
 	return questions, nil
 }
-
-// Default prompt for question generation with context support
-const defaultQuestionGenerationPrompt = `You are a professional question generation assistant. Your task is to generate related questions that users might ask based on the given [Main Content].
-
-{{context}}
-## Main Content (generate questions based on this content)
-Document name: {{doc_name}}
-Document content:
-{{content}}
-
-## Core Requirements
-- Generated questions must be directly related to the [Main Content]
-- Questions must NOT use any pronouns or referential words (such as "it", "this", "that document", "this article", "the text", "its", etc.); use specific names instead
-- Questions must be complete and self-contained, understandable without additional context
-- Questions should be natural questions that users would likely ask in real scenarios
-- Questions should be diverse, covering different aspects of the content
-- Each question should be concise and clear, within 30 words
-- Generate {{question_count}} questions
-
-## Suggested Question Types
-- Definition: What is...? What does... mean?
-- Reason: Why...? What is the reason for...?
-- Method: How to...? What is the way to...?
-- Comparison: What is the difference between... and...?
-- Application: What scenarios can... be used for?
-
-## Output Format
-Output the question list directly, one question per line, without numbering or other prefixes.
-
-## CRITICAL: Language Rule
-- Generate questions in the SAME LANGUAGE as the source document
-- If the document is in Korean, generate questions in Korean
-- If the document is in English, generate questions in English
-- If the document is in Chinese, generate questions in Chinese`
 
 // GetKnowledgeFile retrieves the physical file associated with a knowledge entry
 func (s *knowledgeService) GetKnowledgeFile(ctx context.Context, id string) (io.ReadCloser, string, error) {
@@ -2828,7 +2829,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 // isValidFileType checks if a file type is supported
 func isValidFileType(filename string) bool {
 	switch strings.ToLower(getFileType(filename)) {
-	case "pdf", "txt", "docx", "doc", "md", "markdown", "png", "jpg", "jpeg", "gif", "csv", "xlsx", "xls", "pptx", "ppt":
+	case "pdf", "txt", "docx", "doc", "md", "markdown", "png", "jpg", "jpeg", "gif", "csv", "xlsx", "xls", "pptx", "ppt", "json":
 		return true
 	default:
 		return false
@@ -5915,17 +5916,22 @@ func (s *knowledgeService) ExportFAQEntries(ctx context.Context, kbID string) ([
 
 // buildTagMap builds a map from tag_id to tag_name for the given knowledge base.
 func (s *knowledgeService) buildTagMap(ctx context.Context, tenantID uint64, kbID string) (map[string]string, error) {
-	// Get all tags for this knowledge base (no pagination limit)
-	page := &types.Pagination{Page: 1, PageSize: 10000}
-	tags, _, err := s.tagRepo.ListByKB(ctx, tenantID, kbID, page, "")
-	if err != nil {
-		return nil, err
-	}
+	const pageSize = 1000
+	tagMap := make(map[string]string)
 
-	tagMap := make(map[string]string, len(tags))
-	for _, tag := range tags {
-		if tag != nil {
-			tagMap[tag.ID] = tag.Name
+	for pageNum := 1; ; pageNum++ {
+		page := &types.Pagination{Page: pageNum, PageSize: pageSize}
+		tags, _, err := s.tagRepo.ListByKB(ctx, tenantID, kbID, page, "")
+		if err != nil {
+			return nil, err
+		}
+		for _, tag := range tags {
+			if tag != nil {
+				tagMap[tag.ID] = tag.Name
+			}
+		}
+		if len(tags) < pageSize {
+			break
 		}
 	}
 	return tagMap, nil
@@ -6047,6 +6053,7 @@ func (s *knowledgeService) ensureFAQKnowledge(
 		TenantID:         tenantID,
 		KnowledgeBaseID:  kb.ID,
 		Type:             types.KnowledgeTypeFAQ,
+		Channel:          types.ChannelWeb,
 		Title:            fmt.Sprintf("%s - FAQ", kb.Name),
 		Description:      "FAQ 条目容器",
 		Source:           types.KnowledgeTypeFAQ,
@@ -6237,6 +6244,7 @@ func buildFAQChunkContent(meta *types.FAQChunkMetadata, mode types.FAQIndexMode)
 
 // checkFAQQuestionDuplicate 检查标准问和相似问是否与知识库中其他条目重复
 // excludeChunkID 用于排除当前正在编辑的条目（更新时使用）
+// 按照批量导入时的检查方式：先构建已存在问题集合，再统一检查
 func (s *knowledgeService) checkFAQQuestionDuplicate(
 	ctx context.Context,
 	tenantID uint64,
@@ -6244,14 +6252,14 @@ func (s *knowledgeService) checkFAQQuestionDuplicate(
 	excludeChunkID string,
 	meta *types.FAQChunkMetadata,
 ) error {
-	// 首先检查当前条目自身的相似问是否与标准问重复
+	// 1. 首先检查当前条目自身的相似问是否与标准问重复
 	for _, q := range meta.SimilarQuestions {
 		if q == meta.StandardQuestion {
 			return werrors.NewBadRequestError(fmt.Sprintf("相似问「%s」不能与标准问相同", q))
 		}
 	}
 
-	// 检查当前条目自身的相似问之间是否有重复
+	// 2. 检查当前条目自身的相似问之间是否有重复
 	seen := make(map[string]struct{})
 	for _, q := range meta.SimilarQuestions {
 		if _, exists := seen[q]; exists {
@@ -6260,54 +6268,80 @@ func (s *knowledgeService) checkFAQQuestionDuplicate(
 		seen[q] = struct{}{}
 	}
 
-	// 查询知识库中已有的所有FAQ chunks的metadata
-	existingChunks, err := s.chunkRepo.ListAllFAQChunksWithMetadataByKnowledgeBaseID(ctx, tenantID, kbID)
-	if err != nil {
-		return fmt.Errorf("failed to list existing FAQ chunks: %w", err)
+	// 3. 检查反例问题是否与标准问或相似问重复（反例不能和正例相同）
+	positiveQuestions := make(map[string]struct{})
+	positiveQuestions[meta.StandardQuestion] = struct{}{}
+	for _, q := range meta.SimilarQuestions {
+		positiveQuestions[q] = struct{}{}
+	}
+	negativeQuestionsSeen := make(map[string]struct{})
+	for _, q := range meta.NegativeQuestions {
+		if q == "" {
+			continue
+		}
+		// 检查反例是否与标准问重复
+		if q == meta.StandardQuestion {
+			return werrors.NewBadRequestError(fmt.Sprintf("反例问题「%s」不能与标准问相同", q))
+		}
+		// 检查反例是否与相似问重复
+		if _, exists := positiveQuestions[q]; exists {
+			return werrors.NewBadRequestError(fmt.Sprintf("反例问题「%s」不能与相似问相同", q))
+		}
+		// 检查反例之间是否重复
+		if _, exists := negativeQuestionsSeen[q]; exists {
+			return werrors.NewBadRequestError(fmt.Sprintf("反例问题「%s」重复", q))
+		}
+		negativeQuestionsSeen[q] = struct{}{}
 	}
 
-	// 构建已存在的标准问和相似问集合
-	for _, chunk := range existingChunks {
-		// 排除当前正在编辑的条目
-		if chunk.ID == excludeChunkID {
-			continue
-		}
+	// 4. 将标准问和所有相似问合并，用一条 DB 查询检查是否与其他条目冲突（替代全量扫描）
+	allQuestions := make([]string, 0, 1+len(meta.SimilarQuestions))
+	allQuestions = append(allQuestions, meta.StandardQuestion)
+	allQuestions = append(allQuestions, meta.SimilarQuestions...)
 
-		existingMeta, err := chunk.FAQMetadata()
-		if err != nil || existingMeta == nil {
-			continue
-		}
+	dupChunk, err := s.chunkRepo.FindFAQChunkWithDuplicateQuestion(ctx, tenantID, kbID, excludeChunkID, allQuestions)
+	if err != nil {
+		return fmt.Errorf("failed to check FAQ question duplicate: %w", err)
+	}
+	if dupChunk == nil {
+		return nil
+	}
 
-		// 检查标准问是否重复
-		if existingMeta.StandardQuestion == meta.StandardQuestion {
+	existingMeta, err := dupChunk.FAQMetadata()
+	if err != nil || existingMeta == nil {
+		return werrors.NewBadRequestError("标准问或相似问与已有条目重复")
+	}
+
+	// 5–7. 与原先全量扫描一致的报错语义：先检查标准问，再逐条检查相似问
+	existingSimilarSet := make(map[string]struct{}, len(existingMeta.SimilarQuestions))
+	for _, q := range existingMeta.SimilarQuestions {
+		if q != "" {
+			existingSimilarSet[q] = struct{}{}
+		}
+	}
+
+	if meta.StandardQuestion != "" {
+		if meta.StandardQuestion == existingMeta.StandardQuestion {
 			return werrors.NewBadRequestError(fmt.Sprintf("标准问「%s」已存在", meta.StandardQuestion))
 		}
-
-		// 检查当前标准问是否与已有相似问重复
-		for _, q := range existingMeta.SimilarQuestions {
-			if q == meta.StandardQuestion {
-				return werrors.NewBadRequestError(fmt.Sprintf("标准问「%s」与已有相似问重复", meta.StandardQuestion))
-			}
-		}
-
-		// 检查当前相似问是否与已有标准问重复
-		for _, q := range meta.SimilarQuestions {
-			if q == existingMeta.StandardQuestion {
-				return werrors.NewBadRequestError(fmt.Sprintf("相似问「%s」与已有标准问重复", q))
-			}
-		}
-
-		// 检查当前相似问是否与已有相似问重复
-		for _, q := range meta.SimilarQuestions {
-			for _, existingQ := range existingMeta.SimilarQuestions {
-				if q == existingQ {
-					return werrors.NewBadRequestError(fmt.Sprintf("相似问「%s」已存在", q))
-				}
-			}
+		if _, ok := existingSimilarSet[meta.StandardQuestion]; ok {
+			return werrors.NewBadRequestError(fmt.Sprintf("标准问「%s」已存在", meta.StandardQuestion))
 		}
 	}
 
-	return nil
+	for _, q := range meta.SimilarQuestions {
+		if q == "" {
+			continue
+		}
+		if q == existingMeta.StandardQuestion {
+			return werrors.NewBadRequestError(fmt.Sprintf("相似问「%s」已存在", q))
+		}
+		if _, ok := existingSimilarSet[q]; ok {
+			return werrors.NewBadRequestError(fmt.Sprintf("相似问「%s」已存在", q))
+		}
+	}
+
+	return werrors.NewBadRequestError("标准问或相似问与已有条目重复")
 }
 
 // resolveTagID resolves tag ID (UUID) from payload, prioritizing tag_id (seq_id) over tag_name
@@ -6831,11 +6865,17 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 		return
 	}
 
-	// Resolve remote images: download http(s) images, upload to storage, replace URLs.
-	// This runs before chunking so that chunks contain stable provider:// URLs.
+	// Resolve embedded data:base64 images and remote http(s) images → storage, replace URLs.
+	// Runs before chunking so chunks contain stable provider:// URLs.
 	var resolvedImages []docparser.StoredImage
 	if s.imageResolver != nil {
 		fileSvc := s.resolveFileService(ctx, kb)
+		afterDataURI, fromDataURI, _ := s.imageResolver.ResolveDataURIImages(ctx, clean, fileSvc, knowledge.TenantID)
+		if len(fromDataURI) > 0 {
+			logger.Infof(ctx, "Resolved %d data-URI images for manual knowledge %s", len(fromDataURI), knowledge.ID)
+			clean = afterDataURI
+			resolvedImages = append(resolvedImages, fromDataURI...)
+		}
 		updatedContent, storedImages, resolveErr := s.imageResolver.ResolveRemoteImages(ctx, clean, fileSvc, knowledge.TenantID)
 		if resolveErr != nil {
 			logger.Warnf(ctx, "Remote image resolution partially failed: %v", resolveErr)
@@ -6843,7 +6883,7 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 		if len(storedImages) > 0 {
 			logger.Infof(ctx, "Resolved %d remote images for manual knowledge %s", len(storedImages), knowledge.ID)
 			clean = updatedContent
-			resolvedImages = storedImages
+			resolvedImages = append(resolvedImages, storedImages...)
 		}
 	}
 
@@ -6869,6 +6909,13 @@ func (s *knowledgeService) triggerManualProcessing(ctx context.Context,
 		// through so processChunks will enqueue image:multimodal tasks (OCR + caption).
 		EnableMultimodel: kb.IsMultimodalEnabled() && len(resolvedImages) > 0,
 		StoredImages:     resolvedImages,
+	}
+	if kb.QuestionGenerationConfig != nil && kb.QuestionGenerationConfig.Enabled {
+		opts.EnableQuestionGeneration = true
+		opts.QuestionCount = kb.QuestionGenerationConfig.QuestionCount
+		if opts.QuestionCount <= 0 {
+			opts.QuestionCount = 3
+		}
 	}
 
 	if kb.ChunkingConfig.EnableParentChild {
@@ -7495,7 +7542,11 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 			})
 			start = end
 		}
-		s.processChunks(ctx, kb, knowledge, passageChunks)
+		passageOpts := ProcessChunksOptions{
+			EnableQuestionGeneration: payload.EnableQuestionGeneration,
+			QuestionCount:            payload.QuestionCount,
+		}
+		s.processChunks(ctx, kb, knowledge, passageChunks, passageOpts)
 		return nil
 	} else {
 		// File import
@@ -8575,6 +8626,7 @@ func (s *knowledgeService) getOrCreateFAQKnowledge(ctx context.Context, kb *type
 		TenantID:         kb.TenantID,
 		KnowledgeBaseID:  kb.ID,
 		Type:             types.KnowledgeTypeFAQ,
+		Channel:          types.ChannelWeb,
 		Title:            "FAQ",
 		ParseStatus:      "completed",
 		EnableStatus:     "enabled",
@@ -8586,6 +8638,7 @@ func (s *knowledgeService) getOrCreateFAQKnowledge(ctx context.Context, kb *type
 		knowledge.Title = srcKnowledge.Title
 		knowledge.Description = srcKnowledge.Description
 		knowledge.Source = srcKnowledge.Source
+		knowledge.Channel = srcKnowledge.Channel
 		knowledge.Metadata = srcKnowledge.Metadata
 	}
 

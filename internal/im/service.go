@@ -57,13 +57,13 @@ const (
 // All IM-related Redis keys are defined here for discoverability and to avoid
 // scattered string literals across multiple files.
 const (
-	RedisKeyLeader     = "im:ws:leader:"     // + channelID — WebSocket leader election
-	RedisKeyDedup      = "im:dedup:"         // + messageID — message deduplication
-	RedisKeyStop       = "im:stop:"          // + userKey   — cross-instance /stop marker (pre-execution)
-	RedisKeyInflight   = "im:inflight:"      // + userKey   — maps userKey → sessionID:messageID for cross-instance /stop
-	RedisKeyQueueUser  = "im:queue:user:"    // + userKey   — global per-user queue counter
-	RedisKeyRateLimit  = "im:ratelimit:"     // + key       — sliding-window rate limiting
-	RedisKeyGlobalGate = "im:global:active"  // global concurrent worker counter
+	RedisKeyLeader     = "im:ws:leader:"    // + channelID — WebSocket leader election
+	RedisKeyDedup      = "im:dedup:"        // + messageID — message deduplication
+	RedisKeyStop       = "im:stop:"         // + userKey   — cross-instance /stop marker (pre-execution)
+	RedisKeyInflight   = "im:inflight:"     // + userKey   — maps userKey → sessionID:messageID for cross-instance /stop
+	RedisKeyQueueUser  = "im:queue:user:"   // + userKey   — global per-user queue counter
+	RedisKeyRateLimit  = "im:ratelimit:"    // + key       — sliding-window rate limiting
+	RedisKeyGlobalGate = "im:global:active" // global concurrent worker counter
 )
 
 // channelState holds runtime state for a running IM channel.
@@ -1424,6 +1424,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 	userMsg, err := s.messageService.CreateMessage(qaCtx, &types.Message{
 		SessionID: session.ID, Role: "user", Content: msg.Content,
 		RequestID: requestID, CreatedAt: time.Now(), IsCompleted: true,
+		Channel: "im",
 	})
 	if err != nil {
 		return fmt.Errorf("create user message: %w", err)
@@ -1433,6 +1434,7 @@ func (s *Service) handleMessageStream(ctx context.Context, msg *IncomingMessage,
 	assistantMsg, err := s.messageService.CreateMessage(qaCtx, &types.Message{
 		SessionID: session.ID, Role: "assistant",
 		RequestID: requestID, CreatedAt: time.Now(), IsCompleted: false,
+		Channel: "im",
 	})
 	if err != nil {
 		return fmt.Errorf("create assistant message: %w", err)
@@ -1611,6 +1613,7 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 		RequestID:   requestID,
 		CreatedAt:   time.Now(),
 		IsCompleted: true,
+		Channel:     "im",
 	})
 	if err != nil {
 		return "", fmt.Errorf("create user message: %w", err)
@@ -1623,6 +1626,7 @@ func (s *Service) runQA(ctx context.Context, session *types.Session, query strin
 		RequestID:   requestID,
 		CreatedAt:   time.Now(),
 		IsCompleted: false,
+		Channel:     "im",
 	})
 	if err != nil {
 		return "", fmt.Errorf("create assistant message: %w", err)
@@ -1915,7 +1919,7 @@ func (s *Service) processFileToKnowledgeBase(ctx context.Context, msg *IncomingM
 	fh := newInMemoryFileHeader(fileName, content)
 
 	// Create knowledge entry via the knowledge service
-	knowledge, err := s.knowledgeService.CreateKnowledgeFromFile(kbCtx, kbID, fh, nil, nil, "", "")
+	knowledge, err := s.knowledgeService.CreateKnowledgeFromFile(kbCtx, kbID, fh, nil, nil, "", "", imPlatformToChannel(channel.Platform))
 	if err != nil {
 		errMsg := err.Error()
 		// Check for duplicate file
@@ -2263,6 +2267,24 @@ func fileExtension(filename string) string {
 		return ""
 	}
 	return strings.ToLower(parts[len(parts)-1])
+}
+
+// imPlatformToChannel maps an IM platform identifier to a Knowledge.Channel constant.
+func imPlatformToChannel(platform string) string {
+	switch strings.ToLower(platform) {
+	case "wechat":
+		return types.ChannelWechat
+	case "wecom", "wxwork":
+		return types.ChannelWecom
+	case "feishu", "lark":
+		return types.ChannelFeishu
+	case "dingtalk":
+		return types.ChannelDingtalk
+	case "slack":
+		return types.ChannelSlack
+	default:
+		return types.ChannelIM
+	}
 }
 
 // newInMemoryFileHeader wraps in-memory file content as a *multipart.FileHeader

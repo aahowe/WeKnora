@@ -167,6 +167,8 @@ const onVisibleChange = (visible: boolean) => {
 let isCardDetails = ref(false);
 let timeout: ReturnType<typeof setInterval> | null = null;
 let delDialog = ref(false)
+let rebuildDialog = ref(false)
+let rebuildKnowledgeItem = ref<KnowledgeCard>({ id: '', parse_status: '' })
 let knowledge = ref<KnowledgeCard>({ id: '', parse_status: '' })
 let knowledgeIndex = ref(-1)
 let knowledgeScroll = ref()
@@ -277,6 +279,23 @@ const formatFileSize = (bytes?: number | string) => {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / (1024 * 1024)).toFixed(1)} MB`
 }
+
+const channelLabelMap: Record<string, string> = {
+  web: 'knowledgeBase.channelWeb',
+  api: 'knowledgeBase.channelApi',
+  browser_extension: 'knowledgeBase.channelBrowserExtension',
+  wechat: 'knowledgeBase.channelWechat',
+  wecom: 'knowledgeBase.channelWecom',
+  feishu: 'knowledgeBase.channelFeishu',
+  dingtalk: 'knowledgeBase.channelDingtalk',
+  slack: 'knowledgeBase.channelSlack',
+  im: 'knowledgeBase.channelIm',
+};
+
+const getChannelLabel = (channel: string) => {
+  const key = channelLabelMap[channel];
+  return key ? t(key) : t('knowledgeBase.channelUnknown');
+};
 
 // 获取知识条目的显示类型
 const getKnowledgeType = (item: any) => {
@@ -1048,7 +1067,7 @@ const handleDocumentUpload = async (event: Event) => {
       failCount++;
       let errorMessage = error?.error?.message || error?.message || t('knowledgeBase.uploadFailed');
       if (error?.code === 'duplicate_file') {
-        errorMessage = "文件已存在";
+        errorMessage = t('knowledgeBase.fileExists');
       }
       if (totalCount === 1) {
         MessagePlugin.error(errorMessage);
@@ -1299,7 +1318,7 @@ const handleManualEdit = (index: number, item: KnowledgeCard) => {
   });
 };
 
-const handleKnowledgeReparse = async (index: number, item: KnowledgeCard) => {
+const handleKnowledgeReparse = (index: number, item: KnowledgeCard) => {
   if (isFAQ.value) return;
   if (!canEdit.value) return;
   if (!item?.id) {
@@ -1313,10 +1332,14 @@ const handleKnowledgeReparse = async (index: number, item: KnowledgeCard) => {
   if (cardList.value[index]) {
     cardList.value[index].isMore = false;
   }
-  const confirm = window.confirm(
-    t('knowledgeBase.rebuildConfirm', { fileName: item.file_name || item.title || '' }) as string,
-  );
-  if (!confirm) return;
+  rebuildKnowledgeItem.value = item;
+  rebuildDialog.value = true;
+};
+
+const rebuildConfirm = async () => {
+  rebuildDialog.value = false;
+  const item = rebuildKnowledgeItem.value;
+  if (!item?.id) return;
   try {
     await reparseKnowledge(item.id);
     MessagePlugin.success(t('knowledgeBase.rebuildSubmitted'));
@@ -1488,7 +1511,7 @@ async function createNewSession(value: string): Promise<void> {
         ref="uploadInputRef"
         type="file"
         class="document-upload-input"
-        :accept="acceptFileTypes || '.pdf,.docx,.doc,.txt,.md,.jpg,.jpeg,.png,.csv,.xlsx,.xls,.pptx,.ppt'"
+        :accept="acceptFileTypes || '.pdf,.docx,.doc,.txt,.md,.json,.jpg,.jpeg,.png,.csv,.xlsx,.xls,.pptx,.ppt'"
         multiple
         @change="handleDocumentUpload"
       />
@@ -1736,7 +1759,7 @@ async function createNewSession(value: string): Promise<void> {
                             @click.stop="openMore(index)"
                             :class="[moreIndex == index ? 'active-more' : '']"
                           >
-                            <img class="more" src="@/assets/img/more.png" alt="" />
+                            <img class="more-icon" src="@/assets/img/more.png" alt="" />
                           </div>
                           <template #content>
                             <!-- Normal menu -->
@@ -1917,6 +1940,7 @@ async function createNewSession(value: string): Promise<void> {
                       </template>
                       <div class="card-popover-meta">
                         <span class="card-popover-time">{{ t('knowledgeBase.updatedAt') }}：{{ formatDocTime(hoveredCardItem.updated_at) }}</span>
+                        <span v-if="(hoveredCardItem as any).channel && (hoveredCardItem as any).channel !== 'web'" class="card-popover-channel">{{ getChannelLabel((hoveredCardItem as any).channel) }}</span>
                         <span v-if="getTagName(hoveredCardItem.tag_id)" class="card-popover-tag">{{ getTagName(hoveredCardItem.tag_id) }}</span>
                         <span class="card-popover-type">{{ getKnowledgeType(hoveredCardItem) }}</span>
                       </div>
@@ -1951,6 +1975,31 @@ async function createNewSession(value: string): Promise<void> {
                 <span class="circle-btn-txt" @click="delDialog = false">{{ t('common.cancel') }}</span>
                 <span class="circle-btn-txt confirm" @click="delCardConfirm">
                   {{ t('knowledgeBase.confirmDelete') }}
+                </span>
+              </div>
+            </div>
+          </t-dialog>
+
+          <!-- 重建知识确认弹窗 -->
+          <t-dialog
+            v-model:visible="rebuildDialog"
+            dialogClassName="del-knowledge"
+            :closeBtn="false"
+            :cancelBtn="null"
+            :confirmBtn="null"
+          >
+            <div class="circle-wrap">
+              <div class="header">
+                <img class="circle-img" src="@/assets/img/circle.png" alt="" />
+                <span class="circle-title">{{ t('knowledgeBase.rebuildDocument') }}</span>
+              </div>
+              <span class="del-circle-txt">
+                {{ t('knowledgeBase.rebuildConfirm', { fileName: rebuildKnowledgeItem.file_name || rebuildKnowledgeItem.title || '' }) }}
+              </span>
+              <div class="circle-btn">
+                <span class="circle-btn-txt" @click="rebuildDialog = false">{{ t('common.cancel') }}</span>
+                <span class="circle-btn-txt confirm" @click="rebuildConfirm">
+                  {{ t('common.confirm') }}
                 </span>
               </div>
             </div>
@@ -3187,7 +3236,7 @@ async function createNewSession(value: string): Promise<void> {
     background: var(--td-component-stroke);
   }
 
-  .more {
+  .more-icon {
     width: 14px;
     height: 14px;
   }
@@ -3350,6 +3399,13 @@ async function createNewSession(value: string): Promise<void> {
     gap: 8px;
     font-size: 11px;
     color: var(--td-text-color-secondary);
+  }
+
+  .card-popover-channel {
+    padding: 1px 6px;
+    background: var(--td-warning-color-light);
+    color: var(--td-warning-color);
+    border-radius: 4px;
   }
 
   .card-popover-tag {

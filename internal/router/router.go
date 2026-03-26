@@ -178,6 +178,8 @@ func RegisterKnowledgeRoutes(r *gin.RouterGroup, handler *handler.KnowledgeHandl
 		kb.POST("/manual", handler.CreateManualKnowledge)
 		// 获取知识库下的知识列表
 		kb.GET("", handler.ListKnowledge)
+		// 清空知识库下的所有知识
+		kb.DELETE("", handler.ClearKnowledgeBaseContents)
 	}
 
 	// 知识路由组
@@ -489,6 +491,8 @@ func RegisterCustomAgentRoutes(r *gin.RouterGroup, agentHandler *handler.CustomA
 		// Copy agent
 		agents.POST("/:id/copy", agentHandler.CopyAgent)
 	}
+	// Registered outside the group to avoid Gin route conflict with /agents/:id/shares in organization routes
+	r.GET("/agents/:id/suggested-questions", agentHandler.GetSuggestedQuestions)
 }
 
 // RegisterSkillRoutes registers skill routes
@@ -674,6 +678,10 @@ func serveFiles(r *gin.Engine) {
 		filePath := strings.TrimSpace(c.Query("file_path"))
 		if filePath == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "missing required parameter: file_path"})
+			return
+		}
+		if strings.Contains(filePath, "..") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file path"})
 			return
 		}
 

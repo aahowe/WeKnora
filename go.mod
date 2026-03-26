@@ -47,6 +47,7 @@ require (
 	github.com/swaggo/gin-swagger v1.6.1
 	github.com/swaggo/swag v1.16.6
 	github.com/tencentyun/cos-go-sdk-v5 v0.7.65
+	github.com/tiktoken-go/tokenizer v0.7.0
 	github.com/volcengine/ve-tos-golang-sdk/v2 v2.7.23
 	github.com/weaviate/weaviate v1.33.0-rc.1
 	github.com/weaviate/weaviate-go-client/v5 v5.5.0
@@ -60,6 +61,7 @@ require (
 	go.uber.org/dig v1.18.1
 	golang.org/x/crypto v0.46.0
 	golang.org/x/sync v0.19.0
+	golang.org/x/sys v0.40.0
 	google.golang.org/api v0.259.0
 	google.golang.org/grpc v1.78.0
 	google.golang.org/protobuf v1.36.11
@@ -114,6 +116,7 @@ require (
 	github.com/coreos/go-systemd/v22 v22.3.2 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/duckdb/duckdb-go-bindings v0.1.24 // indirect
 	github.com/duckdb/duckdb-go-bindings/darwin-amd64 v0.1.24 // indirect
@@ -278,7 +281,6 @@ require (
 	golang.org/x/mod v0.31.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/telemetry v0.0.0-20251208220230-2638a1023523 // indirect
 	golang.org/x/text v0.32.0 // indirect
 	golang.org/x/time v0.14.0 // indirect

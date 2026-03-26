@@ -280,8 +280,10 @@ func (h *KnowledgeHandler) CreateKnowledgeFromFile(c *gin.Context) {
 		tagID = ""
 	}
 
+	channel := c.PostForm("channel")
+
 	// Create knowledge entry from the file
-	knowledge, err := h.kgService.CreateKnowledgeFromFile(ctx, kbID, file, metadata, enableMultimodel, customFileName, tagID)
+	knowledge, err := h.kgService.CreateKnowledgeFromFile(ctx, kbID, file, metadata, enableMultimodel, customFileName, tagID, channel)
 	// Check for duplicate knowledge error
 	if err != nil {
 		if h.handleDuplicateKnowledgeError(c, err, knowledge, "file") {
@@ -348,6 +350,7 @@ func (h *KnowledgeHandler) CreateKnowledgeFromURL(c *gin.Context) {
 		EnableMultimodel *bool  `json:"enable_multimodel"`
 		Title            string `json:"title"`
 		TagID            string `json:"tag_id"`
+		Channel          string `json:"channel"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		logger.Error(ctx, "Failed to parse URL request", err)
@@ -375,7 +378,7 @@ func (h *KnowledgeHandler) CreateKnowledgeFromURL(c *gin.Context) {
 	)
 
 	// Create knowledge entry from the URL
-	knowledge, err := h.kgService.CreateKnowledgeFromURL(ctx, kbID, req.URL, req.FileName, req.FileType, req.EnableMultimodel, req.Title, req.TagID)
+	knowledge, err := h.kgService.CreateKnowledgeFromURL(ctx, kbID, req.URL, req.FileName, req.FileType, req.EnableMultimodel, req.Title, req.TagID, req.Channel)
 	// Check for duplicate knowledge error
 	if err != nil {
 		if h.handleDuplicateKnowledgeError(c, err, knowledge, "url") {
@@ -440,7 +443,7 @@ func (h *KnowledgeHandler) CreateManualKnowledge(c *gin.Context) {
 		return
 	}
 
-	knowledge, err := h.kgService.CreateKnowledgeFromManual(ctx, kbID, &req)
+	knowledge, err := h.kgService.CreateKnowledgeFromManual(ctx, kbID, &req, req.Channel)
 	if err != nil {
 		if appErr, ok := errors.IsAppError(err); ok {
 			c.Error(appErr)
@@ -621,6 +624,90 @@ func (h *KnowledgeHandler) DeleteKnowledge(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "Deleted successfully",
+	})
+}
+
+// ClearKnowledgeBaseContents godoc
+// @Summary      清空知识库内容
+// @Description  删除知识库下的所有知识条目（异步任务）。知识库本身保留，仅清空其中的内容
+// @Tags         知识管理
+// @Accept       json
+// @Produce      json
+// @Param        id   path      string  true  "知识库ID"
+// @Success      200  {object}  map[string]interface{}  "清空任务已提交"
+// @Failure      400  {object}  errors.AppError         "请求参数错误"
+// @Failure      403  {object}  errors.AppError         "权限不足"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /knowledge-bases/{id}/knowledge [delete]
+func (h *KnowledgeHandler) ClearKnowledgeBaseContents(c *gin.Context) {
+	ctx := c.Request.Context()
+	logger.Info(ctx, "Start clearing knowledge base contents")
+
+	kb, kbID, effectiveTenantID, permission, err := h.validateKnowledgeBaseAccess(c)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
+	// Only owner (admin with matching tenant) can clear knowledge base contents
+	tenantID := c.GetUint64(types.TenantIDContextKey.String())
+	if kb.TenantID != tenantID || permission != types.OrgRoleAdmin {
+		c.Error(errors.NewForbiddenError("Only knowledge base owner can clear contents"))
+		return
+	}
+
+	ctx = context.WithValue(ctx, types.TenantIDContextKey, effectiveTenantID)
+
+	knowledgeList, err := h.kgService.ListKnowledgeByKnowledgeBaseID(ctx, kbID)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError("Failed to list knowledge entries").WithDetails(err.Error()))
+		return
+	}
+
+	if len(knowledgeList) == 0 {
+		logger.Infof(ctx, "Knowledge base %s is already empty", secutils.SanitizeForLog(kbID))
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "Knowledge base is already empty",
+			"data":    gin.H{"deleted_count": 0},
+		})
+		return
+	}
+
+	knowledgeIDs := make([]string, 0, len(knowledgeList))
+	for _, knowledge := range knowledgeList {
+		knowledgeIDs = append(knowledgeIDs, knowledge.ID)
+	}
+
+	payload := types.KnowledgeListDeletePayload{
+		TenantID:     effectiveTenantID,
+		KnowledgeIDs: knowledgeIDs,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		logger.Errorf(ctx, "Failed to marshal knowledge list delete payload: %v", err)
+		c.Error(errors.NewInternalServerError("Failed to create cleanup task"))
+		return
+	}
+
+	task := asynq.NewTask(types.TypeKnowledgeListDelete, payloadBytes,
+		asynq.Queue("low"), asynq.MaxRetry(3))
+	info, err := h.asynqClient.Enqueue(task)
+	if err != nil {
+		logger.Errorf(ctx, "Failed to enqueue knowledge list delete task: %v", err)
+		c.Error(errors.NewInternalServerError("Failed to enqueue cleanup task"))
+		return
+	}
+
+	logger.Infof(ctx, "Knowledge base contents clear task enqueued: %s, kb_id: %s, count: %d",
+		info.ID, secutils.SanitizeForLog(kbID), len(knowledgeIDs))
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Knowledge base contents clear task submitted",
+		"data":    gin.H{"deleted_count": len(knowledgeIDs)},
 	})
 }
 

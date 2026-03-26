@@ -160,11 +160,7 @@ func (c *OllamaChat) Chat(ctx context.Context, messages []Message, opts *ChatOpt
 	return &types.ChatResponse{
 		Content:   responseContent,
 		ToolCalls: toolCalls,
-		Usage: struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			TotalTokens      int `json:"total_tokens"`
-		}{
+		Usage: types.TokenUsage{
 			PromptTokens:     promptTokens,
 			CompletionTokens: completionTokens,
 			TotalTokens:      promptTokens + completionTokens,
@@ -231,7 +227,17 @@ func (c *OllamaChat) ChatStream(
 					Done:         false,
 				}
 
-				// Extract and stream content from special tools (complete, not incremental)
+				// Ollama returns tool calls as complete objects (not incremental deltas).
+				// Log this so we can trace non-streaming answer delivery.
+				for _, tc := range resp.Message.ToolCalls {
+					if tc.Function.Name == "final_answer" || tc.Function.Name == "thinking" {
+						argsBytes, _ := json.Marshal(tc.Function.Arguments)
+						logger.Warnf(ctx, "[Ollama Stream] Tool %q arrived non-incrementally (%d bytes args), "+
+							"answer will not be token-streamed to frontend",
+							tc.Function.Name, len(argsBytes))
+					}
+				}
+
 				for _, tc := range resp.Message.ToolCalls {
 					switch tc.Function.Name {
 					case "final_answer":
@@ -262,9 +268,18 @@ func (c *OllamaChat) ChatStream(
 			}
 
 			if resp.Done {
+				var usage *types.TokenUsage
+				if resp.PromptEvalCount > 0 || resp.EvalCount > 0 {
+					usage = &types.TokenUsage{
+						PromptTokens:     resp.PromptEvalCount,
+						CompletionTokens: resp.EvalCount,
+						TotalTokens:      resp.PromptEvalCount + resp.EvalCount,
+					}
+				}
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Done:         true,
+					Usage:        usage,
 				}
 			}
 

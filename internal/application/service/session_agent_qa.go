@@ -70,6 +70,11 @@ func (s *sessionService) AgentQA(
 		return err
 	}
 
+	// Set VLM model ID for tool result image analysis (runtime-only field)
+	if req.CustomAgent != nil && req.CustomAgent.Config.VLMModelID != "" {
+		agentConfig.VLMModelID = req.CustomAgent.Config.VLMModelID
+	}
+
 	// Resolve model ID using shared helper (AgentQA requires a model, so error if not found)
 	effectiveModelID, err := s.resolveChatModelID(ctx, req, agentConfig.KnowledgeBases, agentConfig.KnowledgeIDs)
 	if err != nil {
@@ -106,7 +111,7 @@ func (s *sessionService) AgentQA(
 	}
 
 	// Get or create contextManager for this session
-	contextManager := s.getContextManagerForSession(ctx, req.Session, summaryModel)
+	contextManager := s.getContextManagerForSession()
 
 	// Set system prompt for the current agent in context manager
 	// This ensures the context uses the correct system prompt when switching agents
@@ -201,7 +206,6 @@ func (s *sessionService) buildAgentConfig(
 	customAgent := req.CustomAgent
 	agentConfig := &types.AgentConfig{
 		MaxIterations:               customAgent.Config.MaxIterations,
-		ReflectionEnabled:           customAgent.Config.ReflectionEnabled,
 		Temperature:                 customAgent.Config.Temperature,
 		WebSearchEnabled:            customAgent.Config.WebSearchEnabled && req.WebSearchEnabled,
 		WebSearchMaxResults:         customAgent.Config.WebSearchMaxResults,
@@ -261,6 +265,10 @@ func (s *sessionService) buildAgentConfig(
 	agentConfig.SearchTargets = searchTargets
 	logger.Infof(ctx, "Agent search targets built: %d targets", len(searchTargets))
 
+	if agentConfig.MaxContextTokens <= 0 {
+		agentConfig.MaxContextTokens = types.DefaultMaxContextTokens
+	}
+
 	return agentConfig, nil
 }
 
@@ -318,32 +326,9 @@ func (s *sessionService) configureSkillsFromAgent(
 
 }
 
-// getContextManagerForSession creates a context manager for the session based on configuration
-// Returns the configured context manager (tenant-level or session-level) or default
-func (s *sessionService) getContextManagerForSession(
-	ctx context.Context,
-	session *types.Session,
-	chatModel chat.Chat,
-) interfaces.ContextManager {
-	// Get tenant to access global context configuration
-	tenant, _ := types.TenantInfoFromContext(ctx)
-	// Determine which context config to use: tenant-level or default
-	var contextConfig *types.ContextConfig
-	if tenant != nil && tenant.ContextConfig != nil {
-		// Use tenant-level configuration
-		contextConfig = tenant.ContextConfig
-		logger.Infof(ctx, "Using tenant-level context config for session %s", session.ID)
-	} else {
-		// Use service's default context manager
-		logger.Debugf(ctx, "Using default context manager for session %s", session.ID)
-		contextConfig = &types.ContextConfig{
-			MaxTokens:           llmcontext.DefaultMaxTokens,
-			CompressionStrategy: llmcontext.DefaultCompressionStrategy,
-			RecentMessageCount:  llmcontext.DefaultRecentMessageCount,
-			SummarizeThreshold:  llmcontext.DefaultSummarizeThreshold,
-		}
-	}
-	return llmcontext.NewContextManagerFromConfig(contextConfig, s.sessionStorage, chatModel)
+// getContextManagerForSession creates a context manager for the session.
+func (s *sessionService) getContextManagerForSession() interfaces.ContextManager {
+	return llmcontext.NewContextManagerFromConfig(s.sessionStorage, s.messageRepo)
 }
 
 // getContextForSession retrieves LLM context for a session

@@ -136,7 +136,7 @@ const closePreImg = () => {
 // 创建自定义渲染器实例
 const customRenderer = new marked.Renderer();
 // 覆盖图片渲染方法
-customRenderer.image = function(href, title, text) {
+customRenderer.image = function({href, title, text}) {
     // 验证图片 URL 是否安全
     if (!isValidImageURL(href)) {
         return `<p>${t('error.invalidImageLink')}</p>`;
@@ -317,7 +317,7 @@ onBeforeUnmount(() => {
 .content-wrapper {
     background: var(--td-bg-color-container);
     border-radius: 6px;
-    padding: 8px 12px;
+    padding: 8px 0px;
     transition: all 0.2s ease;
 }
 
