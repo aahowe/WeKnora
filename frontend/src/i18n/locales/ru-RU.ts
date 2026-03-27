@@ -730,7 +730,7 @@ export default {
     rerankTopKLabel: 'Rerank Top K',
     rerankTopKDescription: 'Максимальное количество результатов после повторного ранжирования',
     rerankThresholdLabel: 'Порог Rerank',
-    rerankThresholdDescription: 'Минимальный порог оценки для повторного ранжирования (0-1)',
+    rerankThresholdDescription: 'Минимальный порог оценки для повторного ранжирования (от -10 до 10)',
     rerankModelLabel: 'Модель Rerank',
     rerankModelDescription: 'Выберите модель для повторного ранжирования результатов поиска',
     rerankModelRequired: 'Пожалуйста, выберите модель Rerank. Функция поиска требует эту модель для ранжирования результатов.',
@@ -1430,7 +1430,7 @@ export default {
         },
         minimax: {
           label: 'MiniMax',
-          description: 'MiniMax-M2.1, MiniMax-M2.1-lightning, etc.'
+          description: 'MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.5, etc.'
         },
         mimo: {
           label: 'MiMo',
@@ -1474,7 +1474,7 @@ export default {
         },
         novita: {
           label: "Novita AI",
-          description: "moonshotai/kimi-k2.5, zai-org/glm-5, minimax/minimax-m2.5, qwen/qwen3-embedding-0.6b, etc.",
+          description: "moonshotai/kimi-k2.5, zai-org/glm-5, minimax/minimax-m2.7, qwen/qwen3-embedding-0.6b, etc.",
         },
       }
     },

@@ -607,7 +607,7 @@ export default {
     rerankTopKLabel: "Rerank Top K",
     rerankTopKDescription: "재정렬 후 유지되는 최대 결과 수",
     rerankThresholdLabel: "Rerank 임계값",
-    rerankThresholdDescription: "재정렬의 최소 점수 임계값 (0-1)",
+    rerankThresholdDescription: "재정렬의 최소 점수 임계값 (-10 ~ 10)",
     rerankModelLabel: "Rerank 모델",
     rerankModelDescription: "검색 결과 재정렬에 사용할 모델을 선택하세요",
     rerankModelRequired: "Rerank 모델을 선택하세요. 검색 기능에 이 모델이 필요합니다.",
@@ -1592,7 +1592,7 @@ export default {
         },
         minimax: {
           label: "MiniMax",
-          description: "MiniMax-M2.1, MiniMax-M2.1-lightning 등",
+          description: "MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.5 등",
         },
         mimo: {
           label: "MiMo",
@@ -1636,7 +1636,7 @@ export default {
         },
         novita: {
           label: "Novita AI",
-          description: "moonshotai/kimi-k2.5, zai-org/glm-5, minimax/minimax-m2.5, qwen/qwen3-embedding-0.6b 등",
+          description: "moonshotai/kimi-k2.5, zai-org/glm-5, minimax/minimax-m2.7, qwen/qwen3-embedding-0.6b 등",
         },
       },
     },
