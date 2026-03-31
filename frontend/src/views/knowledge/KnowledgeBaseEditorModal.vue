@@ -25,6 +25,7 @@
                 >
                   <t-icon :name="item.icon" class="nav-icon" />
                   <span class="nav-label">{{ item.label }}</span>
+                  <span v-if="item.badge" class="nav-badge">{{ item.badge }}</span>
                 </div>
               </div>
             </div>
@@ -212,6 +213,11 @@
                   />
                 </div>
 
+                <!-- 数据源管理（仅编辑模式） -->
+                <div v-if="mode === 'edit' && kbId" v-show="currentSection === 'datasource'" class="section">
+                  <DataSourceSettings :kb-id="kbId" @count="dsCount = $event" />
+                </div>
+
                 <!-- 共享设置（仅编辑模式） -->
                 <div v-if="mode === 'edit' && kbId" v-show="currentSection === 'share'" class="section">
                   <KBShareSettings :kb-id="kbId" />
@@ -250,6 +256,7 @@ import KBAdvancedSettings from './settings/KBAdvancedSettings.vue'
 import ModelSelector from '@/components/ModelSelector.vue'
 import GraphSettings from './settings/GraphSettings.vue'
 import KBShareSettings from './settings/KBShareSettings.vue'
+import DataSourceSettings from './settings/DataSourceSettings.vue'
 import { useI18n } from 'vue-i18n'
 
 const uiStore = useUIStore()
@@ -275,9 +282,10 @@ const loading = ref(false)
 const allModels = ref<any[]>([])
 const hasFiles = ref(false)
 const initialStorageProvider = ref<string>('')
+const dsCount = ref(0)
 
 const navItems = computed(() => {
-  const items = [
+  const items: { key: string; icon: string; label: string; badge?: number }[] = [
     { key: 'basic', icon: 'info-circle', label: t('knowledgeEditor.sidebar.basic') },
     { key: 'models', icon: 'control-platform', label: t('knowledgeEditor.sidebar.models') }
   ]
@@ -292,8 +300,10 @@ const navItems = computed(() => {
       { key: 'multimodal', icon: 'image', label: t('knowledgeEditor.sidebar.multimodal') },
       { key: 'advanced', icon: 'setting', label: t('knowledgeEditor.sidebar.advanced') }
     )
+    if (props.mode === 'edit' && props.kbId) {
+      items.push({ key: 'datasource', icon: 'cloud-download', label: t('knowledgeEditor.sidebar.datasource'), badge: dsCount.value || undefined })
+    }
   }
-  // 只在编辑模式下显示共享标签页
   if (props.mode === 'edit' && props.kbId) {
     items.push({ key: 'share', icon: 'share', label: t('knowledgeEditor.sidebar.share') })
   }
@@ -810,7 +820,7 @@ watch(
 .settings-modal {
   position: relative;
   width: 90vw;
-  max-width: 1100px;
+  max-width: 1000px;
   height: 85vh;
   max-height: 750px;
   background: var(--td-bg-color-container);
@@ -915,6 +925,27 @@ watch(
   flex: 1;
 }
 
+.nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--td-bg-color-component);
+  color: var(--td-text-color-secondary);
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.nav-item.active .nav-badge {
+  background: var(--td-brand-color);
+  color: #fff;
+}
+
 .settings-content {
   flex: 1;
   display: flex;
@@ -944,7 +975,7 @@ watch(
   .section-title {
     margin: 0 0 8px 0;
     font-family: "PingFang SC";
-    font-size: 16px;
+    font-size: 20px;
     font-weight: 600;
     color: var(--td-text-color-primary);
   }
@@ -974,7 +1005,7 @@ watch(
   display: block;
   margin-bottom: 8px;
   font-family: "PingFang SC";
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 500;
   color: var(--td-text-color-primary);
 
