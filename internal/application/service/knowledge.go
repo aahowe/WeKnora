@@ -383,6 +383,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		}
 	}
 
+	lang, _ := types.LanguageFromContext(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -393,6 +394,7 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		EnableMultimodel:         enableMultimodelValue,
 		EnableQuestionGeneration: enableQuestionGeneration,
 		QuestionCount:            questionCount,
+		Language:                 lang,
 	}
 
 	payloadBytes, err := json.Marshal(taskPayload)
@@ -557,6 +559,7 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 		}
 	}
 
+	lang, _ := types.LanguageFromContext(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -565,6 +568,7 @@ func (s *knowledgeService) CreateKnowledgeFromURL(ctx context.Context,
 		EnableMultimodel:         enableMultimodelValue,
 		EnableQuestionGeneration: enableQuestionGeneration,
 		QuestionCount:            questionCount,
+		Language:                 lang,
 	}
 
 	payloadBytes, err := json.Marshal(taskPayload)
@@ -770,6 +774,7 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		}
 	}
 
+	lang, _ := types.LanguageFromContext(ctx)
 	taskPayload := types.DocumentProcessPayload{
 		TenantID:                 tenantID,
 		KnowledgeID:              knowledge.ID,
@@ -780,6 +785,7 @@ func (s *knowledgeService) createKnowledgeFromFileURL(
 		EnableMultimodel:         enableMultimodelValue,
 		EnableQuestionGeneration: enableQuestionGeneration,
 		QuestionCount:            questionCount,
+		Language:                 lang,
 	}
 
 	payloadBytes, err := json.Marshal(taskPayload)
@@ -988,6 +994,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              knowledge.ID,
@@ -996,6 +1003,7 @@ func (s *knowledgeService) createKnowledgeFromPassageInternal(ctx context.Contex
 			EnableMultimodel:         false, // 文本段落不支持多模态
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
@@ -1059,6 +1067,46 @@ func (s *knowledgeService) ListPagedKnowledgeByKnowledgeBaseID(ctx context.Conte
 	return types.NewPageResult(total, page, knowledges), nil
 }
 
+// collectImageURLs extracts unique provider:// image URLs from image_info JSON strings.
+func collectImageURLs(ctx context.Context, imageInfos []string) []string {
+	seen := make(map[string]struct{})
+	var urls []string
+	for _, info := range imageInfos {
+		if info == "" {
+			continue
+		}
+		var images []*types.ImageInfo
+		if err := json.Unmarshal([]byte(info), &images); err != nil {
+			logger.Warnf(ctx, "Failed to parse image_info JSON: %v", err)
+			continue
+		}
+		for _, img := range images {
+			if img.URL != "" {
+				if _, exists := seen[img.URL]; !exists {
+					seen[img.URL] = struct{}{}
+					urls = append(urls, img.URL)
+				}
+			}
+		}
+	}
+	return urls
+}
+
+// deleteExtractedImages deletes all extracted image files from storage.
+// Standalone function — callable from both knowledgeService and knowledgeBaseService.
+// Errors are logged but do not fail the overall deletion.
+func deleteExtractedImages(ctx context.Context, fileSvc interfaces.FileService, imageURLs []string) {
+	if len(imageURLs) == 0 {
+		return
+	}
+	logger.Infof(ctx, "Deleting %d extracted images", len(imageURLs))
+	for _, url := range imageURLs {
+		if err := fileSvc.DeleteFile(ctx, url); err != nil {
+			logger.Errorf(ctx, "Failed to delete extracted image %s: %v", url, err)
+		}
+	}
+}
+
 // DeleteKnowledge deletes a knowledge entry and all related resources
 func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error {
 	// Get the knowledge entry
@@ -1082,6 +1130,18 @@ func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error
 	// Resolve file service for this KB before spawning goroutines
 	kb, _ := s.kbService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
 	kbFileSvc := s.resolveFileService(ctx, kb)
+
+	// Collect image URLs before chunks are deleted (ImageInfo references are lost after deletion)
+	tenantID := ctx.Value(types.TenantIDContextKey).(uint64)
+	chunkImageInfos, err := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(ctx, tenantID, []string{id})
+	if err != nil {
+		logger.Errorf(ctx, "Failed to collect image URLs for cleanup: %v", err)
+	}
+	var imageInfoStrs []string
+	for _, ci := range chunkImageInfos {
+		imageInfoStrs = append(imageInfoStrs, ci.ImageInfo)
+	}
+	imageURLs := collectImageURLs(ctx, imageInfoStrs)
 
 	wg := errgroup.Group{}
 	// Delete knowledge embeddings from vector store
@@ -1116,13 +1176,14 @@ func (s *knowledgeService) DeleteKnowledge(ctx context.Context, id string) error
 		return nil
 	})
 
-	// Delete the physical file if it exists
+	// Delete the physical file and extracted images if they exist
 	wg.Go(func() error {
 		if knowledge.FilePath != "" {
 			if err := kbFileSvc.DeleteFile(ctx, knowledge.FilePath); err != nil {
 				logger.GetLogger(ctx).WithField("error", err).Errorf("DeleteKnowledge delete file failed")
 			}
 		}
+		deleteExtractedImages(ctx, kbFileSvc, imageURLs)
 		tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
 		tenantInfo.StorageUsed -= knowledge.StorageSize
 		if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, -knowledge.StorageSize); err != nil {
@@ -1181,6 +1242,25 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 		}
 	}
 
+	// Collect image URLs before chunks are deleted
+	chunkImageInfos, err := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(ctx, tenantInfo.ID, ids)
+	if err != nil {
+		logger.Errorf(ctx, "Failed to collect image URLs for batch cleanup: %v", err)
+	}
+	knowledgeToKB := make(map[string]string)
+	for _, k := range knowledgeList {
+		knowledgeToKB[k.ID] = k.KnowledgeBaseID
+	}
+	kbImageInfos := make(map[string][]string) // kbID → []imageInfo JSON
+	for _, ci := range chunkImageInfos {
+		kbID := knowledgeToKB[ci.KnowledgeID]
+		kbImageInfos[kbID] = append(kbImageInfos[kbID], ci.ImageInfo)
+	}
+	kbImageURLs := make(map[string][]string) // kbID → []imageURL (deduplicated)
+	for kbID, infos := range kbImageInfos {
+		kbImageURLs[kbID] = collectImageURLs(ctx, infos)
+	}
+
 	wg := errgroup.Group{}
 	// 2. Delete knowledge embeddings from vector store
 	wg.Go(func() error {
@@ -1228,7 +1308,7 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 		return nil
 	})
 
-	// 4. Delete the physical file if it exists
+	// 4. Delete the physical file and extracted images if they exist
 	wg.Go(func() error {
 		storageAdjust := int64(0)
 		for _, knowledge := range knowledgeList {
@@ -1239,6 +1319,15 @@ func (s *knowledgeService) DeleteKnowledgeList(ctx context.Context, ids []string
 				}
 			}
 			storageAdjust -= knowledge.StorageSize
+		}
+		// Delete extracted images per KB
+		for kbID, urls := range kbImageURLs {
+			fSvc := kbFileServices[kbID]
+			if fSvc == nil {
+				logger.Warnf(ctx, "No file service for KB %s, skipping %d image deletions", kbID, len(urls))
+				continue
+			}
+			deleteExtractedImages(ctx, fSvc, urls)
 		}
 		tenantInfo.StorageUsed += storageAdjust
 		if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantInfo.ID, storageAdjust); err != nil {
@@ -2369,14 +2458,14 @@ func (s *knowledgeService) generateQuestionsWithContext(ctx context.Context,
 	// Build context section
 	var contextSection string
 	if prevContent != "" || nextContent != "" {
-		contextSection = "## Context Information (for reference only, to help understand the main content)\n"
+		contextSection = "<surrounding_context>\n"
 		if prevContent != "" {
-			contextSection += fmt.Sprintf("[Preceding Context] %s\n", prevContent)
+			contextSection += fmt.Sprintf("[Preceding Content]\n%s\n\n", prevContent)
 		}
 		if nextContent != "" {
-			contextSection += fmt.Sprintf("[Following Context] %s\n", nextContent)
+			contextSection += fmt.Sprintf("[Following Content]\n%s\n\n", nextContent)
 		}
-		contextSection += "\n"
+		contextSection += "</surrounding_context>\n\n"
 	}
 
 	langName := types.LanguageNameFromContext(ctx)
@@ -2704,6 +2793,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2714,6 +2804,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
@@ -2754,6 +2845,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2764,6 +2856,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
@@ -2799,6 +2892,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              existing.ID,
@@ -2807,6 +2901,7 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
@@ -5269,7 +5364,9 @@ func (s *knowledgeService) UpdateKnowledgeTag(ctx context.Context, knowledgeID s
 }
 
 // UpdateKnowledgeTagBatch updates tags for document knowledge items in batch.
-func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, updates map[string]*string) error {
+// authorizedKBID restricts all updates to knowledge items belonging to this KB;
+// pass empty string to skip the check (caller must ensure authorization by other means).
+func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, authorizedKBID string, updates map[string]*string) error {
 	if len(updates) == 0 {
 		return nil
 	}
@@ -5290,6 +5387,19 @@ func (s *knowledgeService) UpdateKnowledgeTagBatch(ctx context.Context, updates 
 	knowledgeList, err := s.repo.GetKnowledgeBatch(ctx, tenantID, knowledgeIDs)
 	if err != nil {
 		return err
+	}
+
+	// Validate all requested IDs were found and belong to the authorized KB
+	if authorizedKBID != "" {
+		if len(knowledgeList) != len(updates) {
+			return werrors.NewForbiddenError("some knowledge IDs are not accessible in the authorized scope")
+		}
+		for _, k := range knowledgeList {
+			if k.KnowledgeBaseID != authorizedKBID {
+				return werrors.NewForbiddenError(
+					fmt.Sprintf("knowledge %s does not belong to authorized knowledge base", k.ID))
+			}
+		}
 	}
 
 	// Build tag ID map for validation
@@ -6995,10 +7105,27 @@ func (s *knowledgeService) cleanupKnowledgeResources(ctx context.Context, knowle
 		}
 	}
 
+	// Collect image URLs before chunks are deleted
+	kb, _ := s.kbService.GetKnowledgeBaseByID(ctx, knowledge.KnowledgeBaseID)
+	fileSvc := s.resolveFileService(ctx, kb)
+	chunkImageInfos, imgErr := s.chunkService.GetRepository().ListImageInfoByKnowledgeIDs(ctx, tenantInfo.ID, []string{knowledge.ID})
+	if imgErr != nil {
+		logger.GetLogger(ctx).WithField("error", imgErr).Error("Failed to collect image URLs for cleanup")
+		cleanupErr = errors.Join(cleanupErr, imgErr)
+	}
+	var imageInfoStrs []string
+	for _, ci := range chunkImageInfos {
+		imageInfoStrs = append(imageInfoStrs, ci.ImageInfo)
+	}
+	imageURLs := collectImageURLs(ctx, imageInfoStrs)
+
 	if err := s.chunkService.DeleteChunksByKnowledgeID(ctx, knowledge.ID); err != nil {
 		logger.GetLogger(ctx).WithField("error", err).Error("Failed to delete manual knowledge chunks")
 		cleanupErr = errors.Join(cleanupErr, err)
 	}
+
+	// Delete extracted images after chunks are deleted
+	deleteExtractedImages(ctx, fileSvc, imageURLs)
 
 	namespace := types.NameSpace{KnowledgeBase: knowledge.KnowledgeBaseID, Knowledge: knowledge.ID}
 	if err := s.graphEngine.DelGraph(ctx, []types.NameSpace{namespace}); err != nil {
@@ -7365,6 +7492,9 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 	ctx = logger.WithRequestID(ctx, payload.RequestId)
 	ctx = logger.WithField(ctx, "document_process", payload.KnowledgeID)
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, payload.TenantID)
+	if payload.Language != "" {
+		ctx = context.WithValue(ctx, types.LanguageContextKey, payload.Language)
+	}
 
 	// 获取任务重试信息，用于判断是否是最后一次重试
 	retryCount, _ := asynq.GetRetryCount(ctx)
@@ -7529,6 +7659,18 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		if convertResult == nil {
 			return nil
 		}
+		// Update knowledge title from extracted page title if not already set
+		if knowledge.Title == "" || knowledge.Title == payload.URL {
+			if extractedTitle := convertResult.Metadata["title"]; extractedTitle != "" {
+				knowledge.Title = extractedTitle
+				knowledge.UpdatedAt = time.Now()
+				if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
+					logger.Warnf(ctx, "Failed to update knowledge title from extracted page title: %v", err)
+				} else {
+					logger.Infof(ctx, "Updated knowledge title to extracted page title: %s", extractedTitle)
+				}
+			}
+		}
 	} else if len(payload.Passages) > 0 {
 		// Text passage import - direct chunking, no conversion needed
 		passageChunks := make([]types.ParsedChunk, 0, len(payload.Passages))
@@ -7565,6 +7707,7 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 
 	// Step 2: Store images and update markdown references
 	var storedImages []docparser.StoredImage
+
 	if s.imageResolver != nil && convertResult != nil {
 		fileSvc := s.resolveFileService(ctx, kb)
 		tenantID, _ := ctx.Value(types.TenantIDContextKey).(uint64)
@@ -7798,6 +7941,7 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			chunkID = chunks[0].ChunkID
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		payload := types.ImageMultimodalPayload{
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
@@ -7806,6 +7950,7 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			ImageURL:        img.ServingURL,
 			EnableOCR:       true,
 			EnableCaption:   true,
+			Language:        lang,
 		}
 
 		payloadBytes, err := json.Marshal(payload)
@@ -8998,6 +9143,7 @@ func (s *knowledgeService) moveKnowledgeReparse(
 			}
 		}
 
+		lang, _ := types.LanguageFromContext(ctx)
 		taskPayload := types.DocumentProcessPayload{
 			TenantID:                 tenantID,
 			KnowledgeID:              knowledge.ID,
@@ -9008,6 +9154,7 @@ func (s *knowledgeService) moveKnowledgeReparse(
 			EnableMultimodel:         enableMultimodel,
 			EnableQuestionGeneration: enableQuestionGeneration,
 			QuestionCount:            questionCount,
+			Language:                 lang,
 		}
 
 		payloadBytes, err := json.Marshal(taskPayload)
