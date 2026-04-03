@@ -236,6 +236,7 @@ export default {
     parsingFailed: 'Parsing failed',
     parsingInProgress: 'Parsing...',
     generatingSummary: 'Generating summary...',
+    documentSummary: 'Summary',
     deleteConfirmation: 'Delete Confirmation',
     confirmDeleteDocument: 'Confirm deletion of document "{fileName}", recovery will be impossible after deletion',
     cancel: 'Cancel',
@@ -1468,7 +1469,8 @@ export default {
       advanced: 'Advanced Settings',
       faq: 'FAQ Settings',
       graph: 'Knowledge Graph',
-      multimodal: 'Multimodal',
+      multimodal: 'Image Processing',
+      asr: 'Audio Processing',
       datasource: 'Data Sources',
       share: 'Sharing'
     },
@@ -1672,8 +1674,17 @@ export default {
       childChunkSizeDescription: 'Size of child chunks used for embedding matching (64-1024)'
     },
     multimodal: {
-      title: 'Multimodal Configuration',
-      description: 'Configure multimodal content understanding for parsing and retrieving non-text content like images',
+      title: 'Image Processing Configuration',
+      description: 'Configure image content understanding for parsing and retrieving non-text content like images',
+    },
+    asr: {
+      title: 'Audio Processing Configuration',
+      description: 'Configure speech recognition to upload audio files (mp3, wav, m4a, flac, ogg) and automatically transcribe to text',
+      label: 'Enable Speech Recognition',
+      desc: 'When enabled, audio files can be uploaded to the knowledge base and automatically transcribed to text',
+      modelLabel: 'ASR Model',
+      modelDescription: 'Speech-to-text model for audio transcription (e.g. OpenAI Whisper)',
+      modelPlaceholder: 'Select an ASR model',
     },
     advanced: {
       title: 'Advanced Settings',
@@ -2075,17 +2086,20 @@ export default {
         embedding: 'Configure embedding models for text vectorization',
         rerank: 'Configure models for result re-ranking',
         vllm: 'Configure vision-language models for multimodal understanding',
+        asr: 'Configure speech-to-text models for audio transcription',
         default: 'Configure model information'
       },
       modelNamePlaceholder: {
         local: 'e.g. llama2:latest',
         remote: 'e.g. gpt-4, claude-3-opus',
         localVllm: 'e.g. llava:latest',
-        remoteVllm: 'e.g. gpt-4-vision-preview'
+        remoteVllm: 'e.g. gpt-4-vision-preview',
+        remoteAsr: 'e.g. whisper-1'
       },
       baseUrlLabel: 'Base URL',
       baseUrlPlaceholder: 'e.g. https://api.openai.com/v1',
       baseUrlPlaceholderVllm: 'e.g. http://localhost:11434/v1',
+      baseUrlPlaceholderAsr: 'e.g. https://api.openai.com/v1',
       apiKeyOptional: 'API Key (optional)',
       apiKeyPlaceholder: 'Enter API Key',
       connectionTest: 'Connection Test',
@@ -2580,6 +2594,11 @@ export default {
       title: 'VLLM Vision Models',
       desc: 'Configure vision-language models for multimodal understanding',
       empty: 'No VLLM models'
+    },
+    asr: {
+      title: 'ASR Speech Models',
+      desc: 'Configure speech-to-text models for audio transcription (e.g. OpenAI Whisper)',
+      empty: 'No ASR models'
     },
     toasts: {
       nameRequired: 'Model name cannot be empty',
@@ -3078,6 +3097,7 @@ export default {
       fileTypeText: 'Plain Text',
       fileTypeJson: 'JSON Files',
       fileTypeImage: 'Images',
+      fileTypeAudio: 'Audio Files',
       engines: {
         builtin: {
           name: 'Built-in',

@@ -259,6 +259,15 @@ func (s *knowledgeService) CreateKnowledgeFromFile(ctx context.Context,
 		logger.Info(ctx, "Image multimodal configuration validation passed")
 	}
 
+	// 检查音频ASR配置完整性 - 只在音频文件时校验
+	if IsAudioType(getFileType(fileName)) {
+		if !kb.ASRConfig.IsASREnabled() {
+			logger.Error(ctx, "ASR model is not configured")
+			return nil, werrors.NewBadRequestError("上传音频文件需要设置ASR语音识别模型")
+		}
+		logger.Info(ctx, "Audio ASR configuration validation passed")
+	}
+
 	// Validate file type
 	logger.Infof(ctx, "Checking file type: %s", fileName)
 	if !isValidFileType(fileName) {
@@ -596,6 +605,11 @@ var allowedFileURLExtensions = map[string]bool{
 	"pdf":  true,
 	"docx": true,
 	"doc":  true,
+	"mp3":  true,
+	"wav":  true,
+	"m4a":  true,
+	"flac": true,
+	"ogg":  true,
 }
 
 // maxFileURLSize is the maximum allowed file size for file URL import (10MB)
@@ -1910,13 +1924,22 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	logger.GetLogger(ctx).Infof("processChunks successfully")
 }
 
-// GetSummary generates a summary for knowledge content using an AI model
+// defaultMaxInputChars is the default maximum characters used as input for summary generation.
+const defaultMaxInputChars = 16384
+
+// getSummary generates a summary for knowledge content using an AI model
 func (s *knowledgeService) getSummary(ctx context.Context,
 	summaryModel chat.Chat, knowledge *types.Knowledge, chunks []*types.Chunk,
 ) (string, error) {
 	// Get knowledge info from the first chunk
 	if len(chunks) == 0 {
 		return "", fmt.Errorf("no chunks provided for summary generation")
+	}
+
+	// Determine max input chars from config
+	maxInputChars := defaultMaxInputChars
+	if s.config.Conversation.Summary != nil && s.config.Conversation.Summary.MaxInputChars > 0 {
+		maxInputChars = s.config.Conversation.Summary.MaxInputChars
 	}
 
 	// concat chunk contents
@@ -1930,11 +1953,8 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		return sortedChunks[i].StartAt < sortedChunks[j].StartAt
 	})
 
-	// concat chunk contents and collect image infos
+	// concat ALL chunk contents (no early truncation) and collect image infos
 	for _, chunk := range sortedChunks {
-		if chunk.EndAt > 4096 {
-			break
-		}
 		// Ensure we don't slice beyond the current content length
 		runes := []rune(chunkContents)
 		if chunk.StartAt <= len(runes) {
@@ -1970,9 +1990,11 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		chunkContents = chunkContents + imageAnnotations
 	}
 
-	if len(chunkContents) < 300 {
-		return chunkContents, nil
-	}
+	// Apply length limit: sample long content to fit within maxInputChars
+	chunkContents = sampleLongContent(chunkContents, maxInputChars)
+
+	logger.GetLogger(ctx).Infof("getSummary: content length=%d chars (max=%d) for knowledge %s",
+		len([]rune(chunkContents)), maxInputChars, knowledge.ID)
 
 	// Prepare content with metadata for summary generation
 	contentWithMetadata := chunkContents
@@ -1988,6 +2010,12 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 
 		// Prepend metadata to content
 		contentWithMetadata = metadataIntro + "\nContent:\n" + contentWithMetadata
+	}
+
+	// Determine max output tokens from config
+	maxTokens := 2048
+	if s.config.Conversation.Summary != nil && s.config.Conversation.Summary.MaxCompletionTokens > 0 {
+		maxTokens = s.config.Conversation.Summary.MaxCompletionTokens
 	}
 
 	// Generate summary using AI model
@@ -2006,7 +2034,7 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 		},
 	}, &chat.ChatOptions{
 		Temperature: 0.3,
-		MaxTokens:   1024,
+		MaxTokens:   maxTokens,
 		Thinking:    &thinking,
 	})
 	if err != nil {
@@ -2015,6 +2043,51 @@ func (s *knowledgeService) getSummary(ctx context.Context,
 	}
 	logger.GetLogger(ctx).WithField("summary", summary.Content).Infof("GetSummary success")
 	return summary.Content, nil
+}
+
+// sampleLongContent returns content that fits within maxChars.
+// For short content (≤ maxChars), it is returned as-is.
+// For long content, it samples: head (60%), tail (20%), and evenly-spaced middle (20%),
+// joined by "[...content omitted...]" markers so the LLM knows content was skipped.
+func sampleLongContent(content string, maxChars int) string {
+	runes := []rune(content)
+	if len(runes) <= maxChars {
+		return content
+	}
+
+	const omitMarker = "\n\n[...content omitted...]\n\n"
+	omitRunes := len([]rune(omitMarker))
+
+	// Reserve space for two omit markers (head→middle, middle→tail)
+	usable := maxChars - 2*omitRunes
+	if usable < 100 {
+		// Fallback: just truncate
+		return string(runes[:maxChars])
+	}
+
+	headLen := usable * 60 / 100
+	tailLen := usable * 20 / 100
+	midLen := usable - headLen - tailLen
+
+	head := string(runes[:headLen])
+	tail := string(runes[len(runes)-tailLen:])
+
+	// Sample middle portion: take a contiguous block from the center of the document
+	midStart := len(runes)/2 - midLen/2
+	if midStart < headLen {
+		midStart = headLen
+	}
+	midEnd := midStart + midLen
+	if midEnd > len(runes)-tailLen {
+		midEnd = len(runes) - tailLen
+		midStart = midEnd - midLen
+		if midStart < headLen {
+			midStart = headLen
+		}
+	}
+	middle := string(runes[midStart:midEnd])
+
+	return head + omitMarker + middle + omitMarker + tail
 }
 
 // enqueueQuestionGenerationTask enqueues an async task for question generation
@@ -2928,7 +3001,8 @@ func (s *knowledgeService) ReparseKnowledge(ctx context.Context, knowledgeID str
 // isValidFileType checks if a file type is supported
 func isValidFileType(filename string) bool {
 	switch strings.ToLower(getFileType(filename)) {
-	case "pdf", "txt", "docx", "doc", "md", "markdown", "png", "jpg", "jpeg", "gif", "csv", "xlsx", "xls", "pptx", "ppt", "json":
+	case "pdf", "txt", "docx", "doc", "md", "markdown", "png", "jpg", "jpeg", "gif", "csv", "xlsx", "xls", "pptx", "ppt", "json",
+		"mp3", "wav", "m4a", "flac", "ogg":
 		return true
 	default:
 		return false
@@ -7340,6 +7414,16 @@ func IsImageType(fileType string) bool {
 	}
 }
 
+// IsAudioType checks if a file type is an audio format
+func IsAudioType(fileType string) bool {
+	switch strings.ToLower(fileType) {
+	case "mp3", "wav", "m4a", "flac", "ogg":
+		return true
+	default:
+		return false
+	}
+}
+
 // downloadFileFromURL downloads a remote file to a temp file and returns its binary content.
 // payloadFileName and payloadFileType are in/out pointers: if they point to an empty string,
 // the function resolves the value from Content-Disposition / URL path and writes it back.
@@ -7582,6 +7666,17 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		return nil
 	}
 
+	// 检查音频ASR配置（仅对文件导入）
+	if payload.FilePath != "" && IsAudioType(payload.FileType) && !kb.ASRConfig.IsASREnabled() {
+		logger.GetLogger(ctx).WithField("knowledge_id", knowledge.ID).
+			Errorf("processDocument audio without ASR model configured")
+		knowledge.ParseStatus = "failed"
+		knowledge.ErrorMessage = "上传音频文件需要设置ASR语音识别模型"
+		knowledge.UpdatedAt = time.Now()
+		s.repo.UpdateKnowledge(ctx, knowledge)
+		return nil
+	}
+
 	// New pipeline: convert -> store images -> chunk -> vectorize -> multimodal tasks
 	var convertResult *types.ReadResult
 	var chunks []types.ParsedChunk
@@ -7703,6 +7798,54 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		if convertResult == nil {
 			return nil
 		}
+	}
+
+	// Step 1.5: ASR transcription for audio files
+	if convertResult != nil && convertResult.IsAudio && len(convertResult.AudioData) > 0 {
+		if !kb.ASRConfig.IsASREnabled() {
+			logger.Error(ctx, "Audio file detected but ASR is not configured")
+			knowledge.ParseStatus = "failed"
+			knowledge.ErrorMessage = "ASR model is not configured for audio transcription"
+			knowledge.UpdatedAt = time.Now()
+			s.repo.UpdateKnowledge(ctx, knowledge)
+			return nil
+		}
+
+		logger.Infof(ctx, "[ASR] Starting audio transcription for knowledge %s, audio size=%d bytes",
+			knowledge.ID, len(convertResult.AudioData))
+
+		asrModel, err := s.modelService.GetASRModel(ctx, kb.ASRConfig.ModelID)
+		if err != nil {
+			logger.Errorf(ctx, "[ASR] Failed to get ASR model: %v", err)
+			knowledge.ParseStatus = "failed"
+			knowledge.ErrorMessage = fmt.Sprintf("failed to get ASR model: %v", err)
+			knowledge.UpdatedAt = time.Now()
+			s.repo.UpdateKnowledge(ctx, knowledge)
+			return nil
+		}
+
+		transcribedText, err := asrModel.Transcribe(ctx, convertResult.AudioData, knowledge.FileName)
+		if err != nil {
+			logger.Errorf(ctx, "[ASR] Transcription failed: %v", err)
+			if isLastRetry {
+				knowledge.ParseStatus = "failed"
+				knowledge.ErrorMessage = fmt.Sprintf("audio transcription failed: %v", err)
+				knowledge.UpdatedAt = time.Now()
+				s.repo.UpdateKnowledge(ctx, knowledge)
+			}
+			return fmt.Errorf("audio transcription failed: %w", err)
+		}
+
+		if transcribedText == "" {
+			logger.Warn(ctx, "[ASR] Transcription returned empty text")
+			transcribedText = "[No speech detected in audio file]"
+		}
+
+		logger.Infof(ctx, "[ASR] Transcription completed, text length=%d", len(transcribedText))
+		// Replace the audio placeholder with the transcribed text
+		convertResult.MarkdownContent = transcribedText
+		convertResult.IsAudio = false
+		convertResult.AudioData = nil
 	}
 
 	// Step 2: Store images and update markdown references

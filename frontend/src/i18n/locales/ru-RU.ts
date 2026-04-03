@@ -208,6 +208,7 @@ export default {
     parsingFailed: 'Парсинг не удался',
     parsingInProgress: 'Парсинг...',
     generatingSummary: 'Генерация резюме...',
+    documentSummary: 'Резюме',
     deleteConfirmation: 'Подтверждение удаления',
     confirmDeleteDocument: 'Подтвердить удаление документа "{fileName}", после удаления восстановление невозможно',
     cancel: 'Отмена',
@@ -1380,17 +1381,20 @@ export default {
         embedding: 'Настройте модель встраивания для текстовой векторизации',
         rerank: 'Настройте модель для повторного ранжирования результатов',
         vllm: 'Настройте визуально-языковую модель для мультимодального понимания',
+        asr: 'Настройте модель распознавания речи для транскрибации аудио',
         default: 'Настройте информацию о модели'
       },
       modelNamePlaceholder: {
         local: 'например: llama2:latest',
         remote: 'например: gpt-4, claude-3-opus',
         localVllm: 'например: llava:latest',
-        remoteVllm: 'например: gpt-4-vision-preview'
+        remoteVllm: 'например: gpt-4-vision-preview',
+        remoteAsr: 'например: whisper-1'
       },
       baseUrlLabel: 'Base URL',
       baseUrlPlaceholder: 'например: https://api.openai.com/v1',
       baseUrlPlaceholderVllm: 'например: http://localhost:11434/v1',
+      baseUrlPlaceholderAsr: 'например: https://api.openai.com/v1',
       apiKeyOptional: 'API Key (опционально)',
       apiKeyPlaceholder: 'Введите API Key',
       connectionTest: 'Проверка соединения',
@@ -1639,7 +1643,8 @@ export default {
       advanced: 'Дополнительные настройки',
       faq: 'FAQ настройки',
       graph: 'Граф знаний',
-      multimodal: 'Мультимодальность',
+      multimodal: 'Обработка изображений',
+      asr: 'Обработка аудио',
       storage: 'Storage Engine',
       datasource: 'Источники данных',
       share: 'Sharing'
@@ -1834,8 +1839,17 @@ export default {
       childChunkSizeDescription: 'Размер дочерних блоков для поиска по эмбеддингам (64-1024)'
     },
     multimodal: {
-      title: 'Мультимодальная конфигурация',
-      description: 'Настройка понимания мультимодального контента для парсинга и поиска нетекстового содержимого, такого как изображения',
+      title: 'Обработка изображений',
+      description: 'Настройте понимание изображений для парсинга и поиска нетекстового контента',
+    },
+    asr: {
+      title: 'Обработка аудио',
+      description: 'Настройте распознавание речи для загрузки аудиофайлов (mp3, wav, m4a, flac, ogg) и автоматической транскрибации в текст',
+      label: 'Включить распознавание речи',
+      desc: 'При включении аудиофайлы могут быть загружены в базу знаний и автоматически транскрибированы в текст',
+      modelLabel: 'Модель ASR',
+      modelDescription: 'Модель распознавания речи для транскрибации аудио (например, OpenAI Whisper)',
+      modelPlaceholder: 'Выберите модель ASR',
     },
     advanced: {
       title: 'Расширенные настройки',
@@ -2379,6 +2393,11 @@ export default {
       desc: 'Визуально-языковые модели для мультимодального понимания',
       empty: 'Нет VLLM моделей'
     },
+    asr: {
+      title: 'ASR модели речи',
+      desc: 'Модели распознавания речи для транскрибации аудио (например, OpenAI Whisper)',
+      empty: 'Нет ASR моделей'
+    },
     toasts: {
       nameRequired: 'Название модели не может быть пустым',
       nameTooLong: 'Название модели не может превышать 100 символов',
@@ -2748,6 +2767,7 @@ export default {
       fileTypeText: 'Текстовые файлы',
       fileTypeJson: 'Файлы JSON',
       fileTypeImage: 'Изображения',
+      fileTypeAudio: 'Аудиофайлы',
       engines: {
         builtin: {
           name: 'Встроенный',
